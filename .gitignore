@@ -1,0 +1,14 @@
+# 1. Environnement virtuel et caches Python 
+.venv/
+__pycache__/
+*.py[cod]
+
+# 2. Secrets et clés d'API
+.env
+
+
+# 3. Fichiers de cache 
+google_cache.json
+
+# 4. Image de rapport de performance 
+rapport_performance.png
