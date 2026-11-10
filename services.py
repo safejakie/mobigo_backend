@@ -6,6 +6,7 @@ import re
 import threading
 import unicodedata
 import copy
+import contextvars
 from collections import Counter, defaultdict
 from typing import Optional, List
 
@@ -885,6 +886,8 @@ def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distan
             ligne = RESEAU["lignes"].get(rid)
             if ligne:
                 types.add(ligne["type"])
+        # on n'affiche que les arrêts de bus, gbaka et bateau-bus (jamais les arrêts de woro-woro)
+        types = types & {"BUS", "GBAKA", "BATEAU"}
         if not types:
             continue
         if "BUS" in types:
@@ -1082,6 +1085,33 @@ def _acces_m(c: dict) -> int:
                                        if e.get("mode") == "WORO_WORO")
 
 
+# Trajets déjà proposés à exclure quand l'utilisateur dit « pas celui-là, autre chose ».
+# (ContextVar : valable seulement pour la requête en cours, aucun changement nécessaire dans main.py)
+_EXCLURE = contextvars.ContextVar("mobigo_exclure", default=None)
+
+
+def _pos_proches(p, q, seuil_m: int = 500) -> bool:
+    if not p or not q:
+        return False
+    return distance_m(p["latitude"], p["longitude"], q["latitude"], q["longitude"]) <= seuil_m
+
+
+def _quasi_identiques(a: dict, b: dict) -> bool:
+    """Deux trajets qui font pratiquement la même chose (mêmes modes, mêmes montées et descentes
+    à moins de 500 m l'une de l'autre) = un seul trajet pour l'utilisateur."""
+    ta, tb = _etapes_transport(a), _etapes_transport(b)
+    if not ta or len(ta) != len(tb):
+        return False
+    for x, y in zip(ta, tb):
+        if x.get("mode") != y.get("mode"):
+            return False
+        mem_dep = x.get("depart") == y.get("depart") or _pos_proches(x.get("depart_pos"), y.get("depart_pos"))
+        mem_arr = x.get("arrivee") == y.get("arrivee") or _pos_proches(x.get("arrivee_pos"), y.get("arrivee_pos"))
+        if not (mem_dep and mem_arr):
+            return False
+    return True
+
+
 # ═══════════════ choisir_propositions (Option 1 · bus X puis bus Y) ═══════════════
 def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
                           priorite=None, budget=None, maxi: int = 4) -> list:
@@ -1094,6 +1124,12 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         cands = [c for c in cands if c.get("cout_partiel_fcfa", 0) <= budget]
     if not cands:
         return []
+    # « je ne veux pas ce trajet » : on retire ce qui ressemble aux trajets déjà proposés
+    deja_proposes = _EXCLURE.get()
+    if deja_proposes:
+        cands = [c for c in cands if not any(_quasi_identiques(c, p) for p in deja_proposes)]
+        if not cands:
+            return []
 
     def marche_finale(c):
         e = c["etapes"][-1]
@@ -1127,7 +1163,17 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         groupes = {}
         for c in sorted(liste, key=cle):
             groupes.setdefault(cle_groupe(c), []).append(c)
-        return sorted(groupes.values(), key=lambda g: cle(g[0]))
+        tries = sorted(groupes.values(), key=lambda g: cle(g[0]))
+        # fusionne les quasi-doublons : même trajet, juste une autre ligne ou un arrêt voisin
+        fusion = []
+        for g in tries:
+            for k in fusion:
+                if _quasi_identiques(k[0], g[0]):
+                    k.extend(g)
+                    break
+            else:
+                fusion.append(g)
+        return fusion
 
     mini = min(c.get("nb_correspondances", 0) for c in cands)
     groupes = grouper([c for c in cands if c.get("nb_correspondances", 0) == mini])
@@ -1239,10 +1285,22 @@ def candidats_multimodaux(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix
     """Mode imposé → UNIQUEMENT ce mode. Sinon : tous les modes combinés
     (bus + gbaka + bateau-bus + trajets mixtes)."""
     if mode_filtre in ("BUS", "GBAKA", "BATEAU"):
+        autorises = {"BUS": {"BUS"}, "GBAKA": {"GBAKA", "WORO_WORO"}, "BATEAU": {"BATEAU"}}[mode_filtre]
+
+        def modes_du_trajet(c):
+            return {e["mode"] for e in c.get("etapes", []) if e["mode"] != "MARCHE"}
+
         out = construire_candidats(dep, dest, mode_filtre, prix_max_ligne)
-        for c in out:
+        purs = [c for c in out if modes_du_trajet(c) <= autorises]
+        if not purs:
+            # aucun trajet 100 % dans ce mode : on cherche des trajets qui le COMBINENT avec un autre
+            mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
+            purs = [c for c in mixtes if modes_du_trajet(c) & autorises and not modes_du_trajet(c) <= autorises]
+            for c in purs:
+                c["combo_mode"] = mode_filtre
+        for c in purs:
             _ajouter_textes(c)
-        return out
+        return purs
     out, vus = [], set()
     groupes = [construire_candidats(dep, dest, "TOUS", prix_max_ligne)]
     par_mode = trajets_par_mode(dep, dest, prix_max_ligne)
@@ -2614,10 +2672,13 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
         s["dernier_trajet"] = trajet
     if attente_mode is not None:
         s["attente_mode"] = attente_mode
+        if attente_mode:
+            s["mode_demande"] = True  # la question « quel mode ? » n'est posée qu'une fois par conversation
 
 
 def analyser_intention(message: str, historique: list = None, session_id: str = None) -> dict:
     s = SESSIONS[session_id] if session_id else {}
+    _EXCLURE.set(None)
     attente = bool(s.get("attente_mode"))
     mode_msg = extraire_mode(message, accepter_tous=attente)
     budget_msg = extraire_budget(message)
@@ -2625,7 +2686,9 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
     if s.get("dernieres_options") and re.search(
             r"(pas convaincu|ne me convient pas|ça ne me convient pas|ca ne me convient pas|"
             r"autre trajet|autre option|change|changer|propose autre|quelque chose d.?autre|"
-            r"non,? merci|je n.?aime pas)", nettoyer_texte(message)):
+            r"non,? merci|je n.?aime pas|je (ne )?veux (pas|plus)|pas (ce|cet|celui|ces|ceux)|"
+            r"enleve|retire|sans ce trajet)", nettoyer_texte(message)):
+        _EXCLURE.set(list(s.get("dernieres_options") or []))
         def signature_option(option):
             return tuple(
                 (e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
@@ -2652,10 +2715,9 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
             "budget_fcfa": budget_msg or s.get("budget_fcfa"), "prix_max_ligne": None,
         }
 
-    if mode_msg and s.get("destination") and re.search(
-            r"\b(et si|et en|plut[oô]t|je veux (y )?aller|je pr[ée]f[eè]re|je voudrais|propose|donne|en plus|aussi)\b",
-            nettoyer_texte(message)) and not re.search(
-            r"(c.?est quoi|qu.?est.?ce|\bpourquoi\b|comment fonctionne)", nettoyer_texte(message)):
+    if mode_msg and s.get("destination") and not re.search(
+            r"(c.?est quoi|qu.?est.?ce|\bpourquoi\b|comment fonctionne|\bcombien\b|est.?ce que|"
+            r"\bou est\b|\bquel(le)?s? (est|sont)\b)", nettoyer_texte(message)):
         return {
             "intention": "TRAJET", "depart": s.get("depart"),
             "destination": s.get("destination"),
@@ -2888,6 +2950,8 @@ def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
             data[cle] = valeur or s.get(cle)
         if mode_msg:
             data["mode_transport"], data["mode_precise"] = mode_msg, True
+        elif s.get("mode_demande"):
+            data["mode_precise"] = True  # déjà demandé plus tôt : on ne repose pas la question, tous les modes
         # ⚠️ On ne réutilise PAS le mode de session pour une nouvelle demande :
         # si l'utilisateur ne précise pas le mode, on cherche dans TOUS les modes.
         data["budget_fcfa"] = budget_msg or s.get("budget_fcfa")
@@ -2911,7 +2975,9 @@ def _points_cles(c: dict) -> str:
         if e["mode"] == "MARCHE":
             continue
         ligne = e.get("numero_ligne") or e.get("nom_ligne") or e["mode"]
-        out.append(f"{e['mode'].lower()} {ligne} : montée à {e['depart']}, descente à {e['arrivee']}")
+        n = e.get("nb_arrets") or 0
+        rang = f" (au {'1er' if n == 1 else str(n) + 'e'} arrêt)" if n > 0 else ""
+        out.append(f"{e['mode'].lower()} {ligne} : montée à {e['depart']}, descente à {e['arrivee']}{rang}")
     return " ; ".join(out)
 
 
@@ -2930,155 +2996,222 @@ SYSTEME_AMI = (
     "Tu es MobiGuide, un assistant sympa basé à Abidjan. Tu discutes naturellement, comme un ami : "
     "tu réponds à toutes les questions (pas seulement les transports), en français, de façon courte "
     "et chaleureuse. Tu ne proposes JAMAIS d'itinéraire si on ne t'en demande pas, et tu ne ramènes "
-    "pas tout aux trajets. Si tu ne connais pas la réponse, dis-le clairement et demande une précision ; "
+    "pas tout aux trajets. Tu ne répètes jamais une formule d'accueil (« avec plaisir », « bonne "
+    "nouvelle »...) ni un conseil que tu as déjà donné plus haut dans la conversation : tu varies et "
+    "tu réponds précisément à ce que l'utilisateur demande maintenant. "
+    "Si tu ne connais pas la réponse, dis-le clairement et demande une précision ; "
     "n'invente jamais une information, une ligne, un prix ou une fonctionnalité."
 )
 
 
 SYSTEME_TRAJET = (
-    "Tu es MobiGuide, assistant de transport à Abidjan, chaleureux et serviable, comme un ami qui "
-    "connaît bien la ville. Tu réponds toujours en français avec un ton amical et encourageant. "
-    "Tu commences TOUJOURS par une phrase d'accueil chaleureuse (ex. « Bonne nouvelle ! », "
-    "« Super, j'ai trouvé des trajets pour toi », « Voici ce que je te propose ») et tu termines "
-    "TOUJOURS par un conseil utile adapté au contexte (météo, trafic, correspondance, budget, "
-    "sécurité, eau, monnaie...). Tu ne listes JAMAIS toutes les étapes d'un trajet (les cartes "
-    "s'en chargent) et tu ne renvoies jamais vers Google Maps ou Waze. Tu n'inventes jamais de "
-    "prix ni d'arrêt."
+    "Tu es MobiGuide, assistant de transport à Abidjan, chaleureux et naturel, comme un ami qui "
+    "connaît bien la ville. Tu réponds toujours en français. Tu ne répètes jamais une formule "
+    "d'accueil ni un conseil déjà dit dans la conversation. Tu n'inventes jamais de prix ni "
+    "d'arrêt et tu ne renvoies jamais vers Google Maps ou Waze."
 )
 
 
-def conseils_trajet(options: list, budget=None) -> str:
-    """Conseils pratiques selon les modes réellement proposés (dits tels quels à l'utilisateur)."""
+def _conseils_liste(options: list, budget=None) -> list:
+    """Conseils pratiques selon les modes réellement proposés : liste de (clé, texte)."""
     modes = set()
     for c in (options or [])[:4]:
         for e in c.get("etapes", []):
             if e.get("mode") != "MARCHE":
                 modes.add(e["mode"])
-    conseils = []
+    out = []
     if "BUS" in modes:
-        conseils.append("En bus, assure-toi de prendre ton ticket ou de badger ta carte auprès du machiniste.")
+        out.append(("BUS", "En bus, prends ton ticket ou badge ta carte auprès du machiniste."))
     if "GBAKA" in modes:
-        conseils.append("Pour les gbakas, le prix n'est pas fixe : demande-le à l'apprenti avant de monter.")
+        out.append(("GBAKA", "Pour les gbakas, le prix n'est pas fixe : demande-le à l'apprenti avant de monter."))
     if "WORO_WORO" in modes:
-        conseils.append("Pour un woro-woro, demande le prix au chauffeur avant de monter.")
+        out.append(("WORO_WORO", "Pour un woro-woro, demande le prix au chauffeur avant de monter."))
     if "BATEAU" in modes:
-        conseils.append("Pour le bateau-bus, garde ton ticket jusqu'à la descente.")
+        out.append(("BATEAU", "Pour le bateau-bus, garde ton ticket jusqu'à la descente."))
     if modes:
-        conseils.append("Signale toujours ton arrêt de descente, que ce soit en bus, en gbaka ou en woro-woro.")
+        out.append(("SIGNALER", "Signale ton arrêt de descente au chauffeur ou à l'apprenti."))
     if budget and modes & {"GBAKA", "WORO_WORO"}:
-        conseils.append(f"Prévois un peu de marge sur tes {budget} FCFA pour les gbakas et woro-woro.")
-    return " ".join(conseils)
+        out.append((f"BUDGET{budget}", f"Prévois un peu de marge sur tes {budget} FCFA pour les gbakas et woro-woro."))
+    return out
+
+
+def conseils_trajet(options: list, budget=None) -> str:
+    return " ".join(t for _, t in _conseils_liste(options, budget))
 
 
 def _habiller_reponse(texte: str, options: list, budget=None) -> str:
-    """Garantit un accueil chaleureux au début et les conseils pratiques à la fin."""
     texte = (texte or "").strip()
-    debut = texte.lower()[:120]
-    if not any(w in debut for w in ("bonne nouvelle", "super", "voici", "bonjour", "salut", "avec plaisir",
-                                    "d'accord", "pas de souci", "ok ", "génial", "parfait", "ravi", "😊", "🙂")):
-        texte = "Avec plaisir ! 😊 " + texte
     conseils = conseils_trajet(options, budget)
     if conseils:
         bas = texte.lower()
-        cles = ("ticket", "badg", "apprenti", "chauffeur", "signale")
-        if sum(1 for k in cles if k in bas) < 2:
-            texte += "\n\n💡 Conseils : " + conseils
+        if sum(1 for k in ("ticket", "badg", "apprenti", "chauffeur", "signale") if k in bas) < 2:
+            texte += "\n\n💡 " + conseils
     return texte
 
 
-# ═══════════════ generer_reponse — chaleureux + conseil ═══════════════
+def _dist_txt(m) -> str:
+    m = int(m or 0)
+    return f"{m / 1000:.1f} km".replace(".", ",") if m >= 1000 else f"{m} m"
+
+
+def _ordinal(n: int) -> str:
+    return "1er" if n == 1 else f"{n}e"
+
+
+_NOM_MODE = {"BUS": "le bus", "GBAKA": "le gbaka", "BATEAU": "le bateau-bus"}
+
+
+def decrire_trajet(c: dict) -> str:
+    """Raconte le trajet étape par étape : marche jusqu'à l'arrêt, montée, rang de l'arrêt de
+    descente (avec son nom), correspondance. Tout vient des données calculées, rien d'inventé."""
+    etapes = c.get("etapes", []) or []
+    idx_transports = [i for i, e in enumerate(etapes) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
+    dernier_t = idx_transports[-1] if idx_transports else -1
+    lignes = []
+    derniere_arrivee = None
+    for i, e in enumerate(etapes):
+        mode, d = e.get("mode"), e.get("distance_m", 0) or 0
+        if mode == "MARCHE":
+            if d < 30:
+                continue
+            minutes = e.get("duree_minutes")
+            duree = f" (environ {minutes} min)" if minutes else ""
+            avant_transport = any(x.get("mode") != "MARCHE" for x in etapes[i + 1:])
+            if avant_transport:
+                t = f"Marche {_dist_txt(d)} jusqu'à l'arrêt « {e.get('arrivee')} »{duree}."
+                if d > SEUIL_MARCHE_LONGUE_M:
+                    t += " C'est assez loin : tu peux aussi prendre un taxi ou un gbaka/woro-woro pour t'y rendre."
+            else:
+                t = f"Il te restera {_dist_txt(d)} à pied jusqu'à ta destination{duree}."
+                if d > SEUIL_MARCHE_LONGUE_M:
+                    t += " C'est assez long : un taxi ou un woro-woro peut t'y déposer."
+            lignes.append(t)
+        elif mode == "WORO_WORO":
+            lignes.append(f"Pour rejoindre l'arrêt « {e.get('arrivee')} » ({_dist_txt(d)}), "
+                          f"prends un woro-woro ou un taxi.")
+        else:
+            if derniere_arrivee and derniere_arrivee != e.get("depart") and i > 0 \
+                    and etapes[i - 1].get("mode") != "MARCHE":
+                lignes.append(f"Rejoins l'arrêt « {e.get('depart')} » (tout près, à pied).")
+            ligne = e.get("numero_ligne")
+            nom = _NOM_MODE.get(mode, str(mode).lower()) + (f" {ligne}" if ligne else "")
+            n = e.get("nb_arrets") or 0
+            descente = (f"descends au {_ordinal(n)} arrêt, à « {e.get('arrivee')} »" if n > 0
+                        else f"descends à « {e.get('arrivee')} »")
+            t = f"Monte dans {nom} à « {e.get('depart')} », puis {descente}"
+            t += " pour prendre la correspondance." if i < dernier_t else "."
+            lignes.append(t)
+            derniere_arrivee = e.get("arrivee")
+    return "\n".join(f"{k}. {t}" for k, t in enumerate(lignes, 1))
+
+
+_LIBELLE_MODE = {"BUS": "bus", "GBAKA": "gbaka", "BATEAU": "bateau-bus"}
+
+
+def _intro_trajet(message: str, contexte: dict, candidats: list, mode: str,
+                  historique: list, premiere: bool, memoire_txt: str, infos_conditions: str) -> str:
+    modele = "Voici ce que je te propose !" if premiere else "Voici ce que j'ai trouvé."
+    if not client:
+        return modele
+    consigne = (
+        "C'est la première fois que tu présentes des trajets dans cette conversation : accueille "
+        "l'utilisateur chaleureusement."
+        if premiere else
+        "Tu as déjà présenté des trajets dans cette conversation : fais une phrase courte et "
+        "naturelle, SANS formule d'accueil (pas de « avec plaisir », « bonne nouvelle », « super »), "
+        "qui reconnaît ce qu'il vient de demander (autre mode, autre budget, autre trajet...)."
+    )
+    prompt = (
+        f'L\'utilisateur vient de demander : "{message}".\n'
+        f"Tu as trouvé {len(candidats)} option(s). Mode demandé : {mode}. "
+        f"Budget : {contexte.get('budget_fcfa') or 'aucun'}.\n"
+        f"Conditions actuelles (à ne mentionner que si c'est vraiment utile) : {infos_conditions or 'aucune'}\n"
+        f"{consigne}\n"
+        "Écris UNE seule phrase de 25 mots maximum. Ne décris pas les étapes (elles seront écrites "
+        "juste après), ne donne aucun conseil, n'invente rien."
+    )
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            messages=_messages_llm(SYSTEME_TRAJET + memoire_txt, prompt, historique),
+            temperature=0.6, max_tokens=80,
+        )
+        texte = (r.choices[0].message.content or "").strip().strip('"').strip()
+        texte = texte.split("\n")[0].strip()
+        return texte or modele
+    except Exception as e:
+        log.error("erreur intro trajet : %s", e)
+        return modele
+
+
+def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, historique: list,
+                    s: dict, memoire_txt: str, infos_conditions: str) -> str:
+    premiere = not s.get("nb_reponses_trajet")
+    budget = contexte.get("budget_fcfa")
+
+    if not candidats:
+        if _EXCLURE.get():
+            return ("Je n'ai pas d'autre trajet vraiment différent entre ces deux lieux. "
+                    "Tu veux essayer un autre mode (bus, gbaka, bateau-bus) ?")
+        return ("Je n'ai trouvé aucun trajet pour l'instant. Vérifie ton départ et ta destination, "
+                "ou essaie un autre mode de transport.")
+
+    combo = candidats[0].get("combo_mode")
+    if combo:
+        lib = _LIBELLE_MODE.get(combo, combo.lower())
+        intro = (f"Je n'ai pas de trajet 100 % {lib} entre ces deux lieux, mais voici des trajets "
+                 f"qui combinent le {lib} avec un autre mode.")
+    else:
+        intro = _intro_trajet(message, contexte, candidats, mode, historique, premiere,
+                              memoire_txt, infos_conditions)
+
+    parts = [intro, "Option 1 :\n" + decrire_trajet(candidats[0])]
+    autres = len(candidats) - 1
+    if autres > 0:
+        parts.append(f"J'ai aussi {autres} autre{'s' if autres > 1 else ''} option{'s' if autres > 1 else ''} "
+                     f"dans les cartes.")
+
+    deja = set(s.get("conseils_donnes") or [])
+    nouveaux = [(k, t) for k, t in _conseils_liste(candidats, budget) if k not in deja]
+    if nouveaux:
+        parts.append("💡 " + " ".join(t for _, t in nouveaux))
+        s["conseils_donnes"] = list(deja | {k for k, _ in nouveaux})
+    s["nb_reponses_trajet"] = (s.get("nb_reponses_trajet") or 0) + 1
+    return "\n\n".join(parts)
+
+
+# ═══════════════ generer_reponse — naturel, sans répétition ═══════════════
 def generer_reponse(message: str, contexte: dict, historique: list = None,
                     session_id: str = None) -> str:
-    if not client:
-        if contexte.get("statut") == "CONVERSATION":
-            return ("Bonjour ! 😊 Je suis MobiGuide, ton guide à Abidjan. "
-                    "Dis-moi où tu veux aller et je te propose le meilleur trajet !")
-        if contexte.get("statut") == "TRAJET":
-            candidats = contexte.get("candidats") or []
-            if not candidats:
-                return ("Oups 😅 je n'ai trouvé aucun trajet pour l'instant. "
-                        "Vérifie ton point de départ et ta destination, ou essaie un autre mode.")
-            meilleur = candidats[0]
-            return _habiller_reponse(
-                f"Bonne nouvelle ! Voici ce que je te propose : {_texte_trajet(meilleur)}.",
-                candidats, contexte.get("budget_fcfa"))
-        return ("Bonjour ! Je suis MobiGuide. Dis-moi ton point de départ et ta destination, "
-                "et je m'occupe du reste 😊")
-
     historique = historique or []
     statut = contexte.get("statut", "")
     candidats = contexte.get("candidats") or []
     mode = contexte.get("mode", "TOUS")
+    s = SESSIONS[session_id] if session_id else {}
 
     infos_conditions = _extraire_infos_conditions(contexte)
     question_conditions = _est_question_conditions(message)
 
     memoire_txt = ""
     if session_id and session_id in SESSIONS:
-        s = SESSIONS[session_id]
         if s.get("depart") or s.get("destination"):
             memoire_txt = (f"\nContexte de la discussion : départ={s.get('depart')}, "
                            f"destination={s.get('destination')}, "
                            f"budget={s.get('budget_fcfa') or 'aucun'}, "
                            f"mode={s.get('mode_transport') or 'non précisé'}")
 
-    if statut == "CONVERSATION":
-        systeme = SYSTEME_AMI + memoire_txt
-        if question_conditions:
-            prompt = f"""{message}
+    if statut == "TRAJET":
+        return _reponse_trajet(message, contexte, candidats, mode, historique, s,
+                               memoire_txt, infos_conditions)
 
-[Infos pour répondre : conditions actuelles calculées par notre modèle ML : {infos_conditions}]
-Utilise UNIQUEMENT ces infos pour trafic / météo, ne renvoie jamais vers Google Maps ou Waze,
-donne un conseil concret en 2-3 phrases maximum."""
-        else:
-            prompt = f"""Réponds directement à la question suivante : {message}
+    if not client:
+        if statut == "CONVERSATION":
+            return ("Bonjour ! 😊 Je suis MobiGuide, ton guide à Abidjan. "
+                    "Dis-moi où tu veux aller et je te propose le meilleur trajet !")
+        return ("Je suis MobiGuide. Dis-moi ton point de départ et ta destination, "
+                "et je m'occupe du reste 😊")
 
-Si cette question ne concerne pas les transports ou dépasse tes données, dis honnêtement que tu ne peux pas
-la traiter et explique brièvement ce que tu peux faire. Ne renvoie pas automatiquement une carte de trajet.
-Réponds en français, avec chaleur, en 2 ou 3 phrases maximum."""
-    elif statut == "TRAJET":
-        systeme = SYSTEME_TRAJET
-        if not candidats:
-            prompt = f"""L'utilisateur a demandé un trajet (mode : {mode}) mais aucun résultat n'a été trouvé.
-Message : "{message}"
-Réponds chaleureusement en 2-3 phrases : excuse-toi brièvement, propose de vérifier les lieux,
-et propose d'essayer un autre mode de transport. Termine par un petit encouragement."""
-        else:
-            meilleur = candidats[0]
-            nom_opt = meilleur.get("libelle") or "première proposition"
-            proches = contexte.get("arrets_proches") or {}
-            if proches.get("depart"):
-                p = proches["depart"][0]
-                memoire_txt += f"\nArrêt le plus proche du départ : {p['nom']} (~{p['distance_m']} m)."
-            prompt = f"""L'utilisateur a demandé : "{message}"
-Mode demandé : {mode}. Budget : {contexte.get('budget_fcfa') or 'aucun'}.
-Tu présentes la proposition « {nom_opt} » (première carte affichée ; {len(candidats)} proposition(s) au total) :
-durée ≈ {meilleur.get('duree_minutes', '?')} min, prix : {_prix_texte(meilleur)},
-{meilleur.get('nb_correspondances', 0)} correspondance(s), {meilleur.get('nb_arrets', '?')} arrêt(s),
-{meilleur.get('marche_m', 0)} m de marche.
-Points de montée / descente (valeurs exactes, ne rien inventer) : {_points_cles(meilleur)}
-Conditions actuelles (modèle ML) : {infos_conditions}{memoire_txt}
-
-Autres lignes possibles à la correspondance : {meilleur.get('alternatives') or 'aucune'}
-Conseil marche longue (à dire tel quel si présent) : {contexte.get('conseil_marche') or 'aucun'}
-Conseils pratiques à transmettre (à dire avec tes mots, sans rien inventer) : {conseils_trajet(candidats, contexte.get('budget_fcfa')) or 'aucun'}
-
-RÈGLES (RESPECTE-LES ABSOLUMENT) :
-1. Commence TOUJOURS par une phrase chaleureuse et personnalisée (ex. « Bonne nouvelle ! »,
-   « Super, j'ai trouvé des trajets pour toi », « Voici ce que je te propose pour X → Y »).
-   JAMAIS de réponse brute sans accueil chaleureux.
-2. Ensuite UNE phrase sur l'option présentée avec l'arrêt de montée et l'arrêt de descente
-   (valeurs exactes ci-dessus, ne rien inventer).
-3. Termine OBLIGATOIREMENT par un conseil utile (au moins une phrase) adapté au contexte :
-   - si pluie/trafic mentionné → conseille sur les conditions ;
-   - si long trajet → conseille sur quoi prévoir (eau, monnaie) ;
-   - si prix variable (gbaka/woro) → préviens que le chauffeur négocie ;
-   - si correspondance → conseille de bien repérer l'arrêt de descente ;
-   - sinon conseil général (arriver 5 min avant, avoir la monnaie, etc.).
-4. N'invente JAMAIS de prix. Si prix variable (gbaka), dis que ça dépend du chauffeur.
-5. Pas de Google Maps / Waze. Pas de liste d'étapes (les cartes les affichent).
-6. 4 phrases maximum au total, ton chaleureux d'ami qui connaît bien Abidjan."""
-    elif statut == "SUIVI":
+    if statut == "SUIVI":
         systeme = SYSTEME_AMI + memoire_txt
         resume = "\n".join(
             f"- {c.get('libelle', 'proposition')} : {c.get('duree_minutes', '?')} min, "
@@ -3091,7 +3224,22 @@ RÈGLES (RESPECTE-LES ABSOLUMENT) :
 {resume or 'aucun trajet en mémoire'}
 Conditions actuelles : {infos_conditions}]
 Réponds directement à SA question, en 2-3 phrases, avec ces infos, sur un ton chaleureux.
-Termine par un petit conseil utile. Ne recopie pas tout l'itinéraire, n'invente rien."""
+Ne répète pas les conseils ni l'accueil déjà donnés plus haut dans la conversation. N'ajoute un conseil
+que s'il est nouveau et vraiment utile. Ne recopie pas tout l'itinéraire, n'invente rien."""
+    elif statut == "CONVERSATION":
+        systeme = SYSTEME_AMI + memoire_txt
+        if question_conditions:
+            prompt = f"""{message}
+
+[Infos pour répondre : conditions actuelles calculées par notre modèle ML : {infos_conditions}]
+Utilise UNIQUEMENT ces infos pour trafic / météo, ne renvoie jamais vers Google Maps ou Waze,
+donne un conseil concret en 2-3 phrases maximum."""
+        else:
+            prompt = f"""Réponds directement à la question suivante : {message}
+
+Si cette question ne concerne pas les transports ou dépasse tes données, dis honnêtement que tu ne peux pas
+la traiter et explique brièvement ce que tu peux faire. Ne renvoie pas automatiquement une carte de trajet.
+Réponds en français, avec chaleur, en 2 ou 3 phrases maximum, sans répéter ce que tu as déjà dit."""
     else:
         systeme = SYSTEME_AMI + memoire_txt
         prompt = message
@@ -3102,15 +3250,7 @@ Termine par un petit conseil utile. Ne recopie pas tout l'itinéraire, n'invente
             messages=_messages_llm(systeme, prompt, historique),
             temperature=0.5, max_tokens=350,
         )
-        texte_llm = reponse.choices[0].message.content.strip()
-        if statut == "TRAJET" and candidats:
-            texte_llm = _habiller_reponse(texte_llm, candidats, contexte.get("budget_fcfa"))
-        return texte_llm
+        return reponse.choices[0].message.content.strip()
     except Exception as e:
         log.error("erreur generation reponse : %s", e)
-        if candidats:
-            meilleur = candidats[0]
-            return _habiller_reponse(
-                f"Bonne nouvelle ! Voici ce que je te propose : {_texte_trajet(meilleur)}.",
-                candidats, contexte.get("budget_fcfa"))
-        return "Bonjour ! Je suis MobiGuide. Dis-moi où tu veux aller et je te propose un trajet."
+        return "Je suis MobiGuide. Dis-moi où tu veux aller et je te propose un trajet."
