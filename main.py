@@ -42,9 +42,7 @@ from ml_mobigo import (
 )
 charger_modele()
 
-# ⚠️ La ligne "import memoire" a été retirée.
-
-app = FastAPI(title="MobiGo API", version="2.4.0") # Version mise à jour
+app = FastAPI(title="MobiGo API", version="2.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -358,12 +356,7 @@ def construire_contexte_session(session_id: str, demande) -> dict:
 def assistant_chat(demande: Demande):
     session_id = demande.session_id or "default"
     
-    # ⚠️ Le bloc de restauration de la base de données a été retiré.
-    # L'historique vient directement de Flutter (demande.historique).
-    
     message = _separer_contexte(demande.message.strip(), session_id, demande.contexte)
-    
-    # ⚠️ La sauvegarde du message utilisateur dans la base a été retirée.
     
     analyse = analyser_intention(message, demande.historique, session_id=session_id)
     intention = analyse["intention"]
@@ -373,7 +366,6 @@ def assistant_chat(demande: Demande):
              intention, mode_transport, analyse.get("mode_precise"))
 
     def repondre(texte: str, **kw) -> ChatResponse:
-        # ⚠️ La sauvegarde de la réponse dans la base et de la session a été retirée.
         return ChatResponse(demande=message, intention=kw.pop("intention", intention),
                             reponse=texte,
                             contexte=_contexte_reponse(session_id), **kw)
@@ -485,11 +477,13 @@ def assistant_chat(demande: Demande):
                 infos.append(f"celui de ta destination est {p_arr['nom']} "
                              f"(~{p_arr['distance_m']} m)")
             detail = (" Pour info, " + " et ".join(infos) + ".") if infos else ""
-            message_aucun = (
-                "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet."
-                if signatures_exclues else
-                "Oups 😅 je ne trouve pas de trajet direct dans ce mode entre ces deux lieux."
-            )
+            
+            # ⚠️ Message mis à jour pour refléter la règle stricte des 500m
+            if signatures_exclues:
+                message_aucun = "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet."
+            else:
+                message_aucun = ("Je ne trouve pas de trajet dont les arrêts sont à moins de 500 m de votre départ et de votre destination (pour vous éviter de trop marcher).")
+                
             return repondre(
                 message_aucun + detail +
                 " Tu veux que j'essaie avec un autre mode (gbaka, bus, bateau-bus) ?",
