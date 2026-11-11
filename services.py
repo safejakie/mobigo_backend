@@ -1080,13 +1080,15 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         e = c["etapes"][0]
         return e.get("distance_m", 0) if e.get("mode") == "MARCHE" else 0
 
-    # ⚠️ RÈGLE STRICTE : Marche maximale de 500m au départ ET à l'arrivée
-    cands = [c for c in cands if marche_finale(c) <= SEUIL_MARCHE_LONGUE_M and marche_initiale(c) <= SEUIL_MARCHE_LONGUE_M]
-    if not cands:
-        return []
+    # ⚠️ RÈGLE : On privilégie les trajets avec une marche < 500m, mais on ne supprime
+    # pas les trajets de 553m si c'est le seul choix possible.
+    courtes = [c for c in cands if marche_finale(c) <= SEUIL_MARCHE_LONGUE_M and marche_initiale(c) <= SEUIL_MARCHE_LONGUE_M]
+    if courtes:
+        cands = courtes
 
     def cle(c):
-        base = c.get("nb_arrets", 0) + _acces_m(c) / 200.0
+        # La marche initiale et finale coûte cher (divisée par 50) pour forcer le choix de l'arrêt le plus proche
+        base = c.get("nb_arrets", 0) + (marche_initiale(c) / 50.0) + (marche_finale(c) / 50.0)
         if priorite == "prix":
             return (c.get("nb_correspondances", 0), c.get("cout_partiel_fcfa", 0), base,
                     c.get("duree_minutes", 999))
@@ -1198,7 +1200,10 @@ def conseil_marche_chat(options: list) -> str:
             vus.add(cle)
             km = e["distance_m"] / 1000
             if i == 0:
-                conseils.append(f"le premier arrêt ({e['arrivee']}) est à {km:.1f} km : prenez un woro-woro ou un taxi pour y aller")
+                if e["distance_m"] > 1000:
+                    conseils.append(f"le premier arrêt ({e['arrivee']}) est à {km:.1f} km : prenez obligatoirement un woro-woro ou un taxi pour y aller")
+                else:
+                    conseils.append(f"le premier arrêt ({e['arrivee']}) est à {km:.1f} km : vous pouvez marcher ou prendre un woro-woro pour y aller")
             else:
                 lignes = _lignes_libres_proches(e["depart_pos"], e["arrivee_pos"])
                 if lignes:
@@ -1340,7 +1345,7 @@ def _duree_sur_ligne(ids: list) -> int:
     return max(5, int(total // 350))
 
 ATTENTE_MINUTES = {"BUS": 8, "GBAKA": 3, "WORO_WORO": 3, "BATEAU": 15}
-SEUIL_MARCHE_LONGUE_M = 500 # ⚠️ PASSAGE À 500M STRICT
+SEUIL_MARCHE_LONGUE_M = 500
 
 def _ajouter_attente(candidat: dict):
     total = 0
@@ -1586,8 +1591,12 @@ def _candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, pr
 def _score_trajet(c: dict) -> int:
     first_walk = c["etapes"][0].get("distance_m", 0) if c["etapes"][0]["mode"] == "MARCHE" else 0
     last_walk = c["etapes"][-1].get("distance_m", 0) if c["etapes"][-1]["mode"] == "MARCHE" else 0
+    
+    # ⚠️ PÉNALITÉ TRÈS FORTE : 1 point de pénalité tous les 10 mètres de marche
+    # Cela force l'algorithme à choisir le trajet avec le moins de marche possible
     penalite_depart = first_walk // 10
-    penalite_arrivee = last_walk // 15
+    penalite_arrivee = last_walk // 10
+    
     return c["duree_minutes"] + c.get("marche_m", 0) // 160 + penalite_depart + penalite_arrivee
 
 def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
@@ -1613,8 +1622,8 @@ def _filtrer_trajets_gbaka(candidats: list) -> list:
                    for e in c["etapes"])
 
     bons = [c for c in candidats if marche_entre(c) <= 250 and not detour(c)]
-    if any(marche_finale(c) <= SEUIL_MARCHE_LONGUE_M for c in bons):
-        bons = [c for c in bons if marche_finale(c) <= SEUIL_MARCHE_LONGUE_M]
+    if any(marche_finale(c) <= 800 for c in bons):
+        bons = [c for c in bons if marche_finale(c) <= 800]
     bons.sort(key=lambda c: (c["nb_correspondances"], _score_trajet(c)))
     uniques, vus = [], set()
     for c in bons:
@@ -1641,10 +1650,8 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
     elif mode_filtre == "BATEAU":
         modes = {"BATEAU"}
 
-    MARCHE_MAX_M = 500
-
     arrets_dep_proximite = arrets_proximite(
-        dep["latitude"], dep["longitude"], MARCHE_MAX_M, tri_par_distance=True
+        dep["latitude"], dep["longitude"], rayon, tri_par_distance=True
     )
     arrets_dep = []
     modes_depart_vus = set()
@@ -1660,10 +1667,15 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
 
     arret_depart_prioritaire = arrets_dep[0] if arrets_dep else None
     arrets_arr_proximite = arrets_proximite(
-        dest["latitude"], dest["longitude"], MARCHE_MAX_M, tri_par_distance=True
+        dest["latitude"], dest["longitude"], rayon, tri_par_distance=True
     )
     arrets_arr = _arrets_utiles(arrets_arr_proximite, modes)
 
+    lignes_d = {r for a in arrets_dep for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
+    lignes_a = {r for a in arrets_arr for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
+    log.info("[trajets v2] mode=%s rayon=%s arrets_dep=%d arrets_arr=%d lignes_dep=%d lignes_arr=%d en_commun=%d",
+             mode_filtre, rayon, len(arrets_dep), len(arrets_arr), len(lignes_d), len(lignes_a),
+             len(lignes_d & lignes_a))
     if not arrets_dep or not arrets_arr:
         return []
 
@@ -1671,7 +1683,13 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
     vus = set()
     meilleur_direct = {}
 
-    descente_max_gbaka = MARCHE_MAX_M
+    descente_max_gbaka = DESCENTE_MAX_GBAKA_M
+    if modes & {"GBAKA", "WORO_WORO"}:
+        d_min = min((distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
+                     for ar in RESEAU["arrets"].values()
+                     if any(RESEAU["lignes"].get(rid, {}).get("type") == "GBAKA"
+                            for rid in RESEAU["lignes_par_arret"].get(ar["id"], []))), default=0)
+        descente_max_gbaka = max(DESCENTE_MAX_GBAKA_M, int(d_min) + 100)
 
     ids_dep_prioritaires = {a["id"] for a in arrets_dep}
     arrets_dep_direct = list(arrets_dep)
@@ -1680,6 +1698,8 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                               if a["id"] not in ids_dep_prioritaires]
         arrets_dep_direct.sort(key=lambda a: a.get("distance_m", 0))
     sens_deja_pris = set()
+    
+    # ── DIRECT : descente à l'arrêt de la ligne le plus proche de la destination ──
     for a_dep in arrets_dep_direct:
         for info in _lignes_passant_par(a_dep["id"], modes):
             ligne = info["ligne"]
@@ -1701,23 +1721,13 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             montee = RESEAU["arrets"][montee_sid]
             montee_d = distance_m(dep["latitude"], dep["longitude"],
                                   montee["latitude"], montee["longitude"])
-            if montee_d > MARCHE_MAX_M:
+            if montee_d > rayon:
                 continue
             idx_montee = seq.index(montee_sid)
 
+            # ⚠️ CORRECTION ICI : On cherche l'arrêt de la ligne le plus proche de la destination
             meilleur_sid, meilleure_d = None, float("inf")
-            if modes == {"GBAKA"}:
-                for sid in seq[idx_montee + 1:]:
-                    ar = RESEAU["arrets"].get(sid)
-                    if not ar:
-                        continue
-                    d = distance_m(dest["latitude"], dest["longitude"],
-                                   ar["latitude"], ar["longitude"])
-                    if d < meilleure_d:
-                        meilleure_d, meilleur_sid = d, sid
             for sid in seq[idx_montee + 1:]:
-                if modes == {"GBAKA"} and meilleur_sid is not None:
-                    break
                 ar = RESEAU["arrets"].get(sid)
                 if not ar:
                     continue
@@ -1725,11 +1735,8 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 if d < meilleure_d:
                     meilleure_d, meilleur_sid = d, sid
             
-            # Si la descente est à plus de 500m, on ignore ce trajet direct
-            if meilleure_d > MARCHE_MAX_M:
-                continue
-
-            if not meilleur_sid:
+            # Si l'arrêt le plus proche de cette ligne est trop loin, on ignore
+            if not meilleur_sid or meilleure_d > rayon:
                 continue
 
             cle = ("D", info["rid"], montee_sid, meilleur_sid)
@@ -1834,7 +1841,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             montee1 = RESEAU["arrets"][montee_sid]
             montee_d = distance_m(dep["latitude"], dep["longitude"],
                                   montee1["latitude"], montee1["longitude"])
-            if montee_d > MARCHE_MAX_M:
+            if montee_d > rayon:
                 continue
             idx_montee = seq1.index(montee_sid)
 
@@ -2898,8 +2905,8 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
             lib = _LIBELLE_MODE.get(mode, mode.lower())
             return (f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux. "
                     f"Tu veux que je cherche en bus, en gbaka ou avec tous les modes ?")
-        return ("Je n'ai pas trouvé de trajet dont les arrêts sont à moins de 500 m de votre départ et de votre destination (pour vous éviter de trop marcher). "
-                "Tu veux que je cherche avec un autre mode ou à une autre adresse ?")
+        return ("Je n'ai trouvé aucun trajet pour l'instant. Vérifie ton départ et ta destination, "
+                "ou essaie un autre mode de transport.")
 
     combo = candidats[0].get("combo_mode")
     if combo:
