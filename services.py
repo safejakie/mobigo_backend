@@ -18,6 +18,13 @@ from config import (
     cache_get, cache_set, distance_m, log,
 )
 
+# ── Règles de proximité (marche et zone) ─────────────────────────────────────
+MARCHE_MAX_M = 500            # marche max au départ ET à l'arrivée, tous modes
+ZONE_CENTRE = (5.3364, -4.0267)   # centre d'Abidjan (lat, lon)
+ZONE_RAYON_M = 40000          # un lieu trouvé doit être dans le Grand Abidjan
+ZONE_REF_MAX_M = 30000        # et pas trop loin du départ / de la destination de l'utilisateur
+
+
 # outils texte 
 def nettoyer_texte(texte: str) -> str:
     if not texte:
@@ -128,15 +135,28 @@ def est_gare(nom: str) -> bool:
     return any(g in n for g in NOMS_GARES if g != "gare")
 
 
-# geocodage – amélioré pour lieux locaux (Azito, etc.)
+# geocodage – avec contrôle de zone (proche d'Abidjan et de la position de référence)
 
-def rechercher_lieu(lieu: Optional[str]):
+def _dans_zone(lat: float, lon: float, ref=None) -> bool:
+    """Le lieu doit être dans le Grand Abidjan et, si on a un point de référence
+    (départ ou position de l'utilisateur), pas trop loin de lui."""
+    if distance_m(lat, lon, ZONE_CENTRE[0], ZONE_CENTRE[1]) > ZONE_RAYON_M:
+        return False
+    if ref and distance_m(lat, lon, ref[0], ref[1]) > ZONE_REF_MAX_M:
+        return False
+    return True
+
+
+def rechercher_lieu(lieu: Optional[str], ref=None):
+    """ref = (latitude, longitude) facultatif : position de l'utilisateur ou point de départ.
+    Quand il est fourni, on garde le résultat Google Maps le plus proche de ce point."""
     if not lieu:
         return None
     lieu_clean = lieu.strip()
     if not lieu_clean:
         return None
-    cle = ("geo", lieu_clean.lower())
+    ref_cle = (round(ref[0], 2), round(ref[1], 2)) if ref else None
+    cle = ("geo", lieu_clean.lower(), ref_cle)
     deja = cache_get(cle)
     if deja:
         return deja
@@ -167,24 +187,29 @@ def rechercher_lieu(lieu: Optional[str]):
             candidats.append(res["place_results"])
         candidats += res.get("local_results", []) or []
 
+        valides = []
         for r in candidats:
             coords = r.get("gps_coordinates") or {}
             lat = coords.get("latitude")
             lon = coords.get("longitude")
             if lat is None or lon is None:
                 continue
+            lat, lon = float(lat), float(lon)
+            if not _dans_zone(lat, lon, ref):
+                continue
             titre = (r.get("title") or lieu_clean).strip()
-            # on évite les résultats trop vagues ou hors Abidjan si possible
-            adresse = (r.get("address") or "").lower()
-            if "abidjan" not in adresse and "côte d'ivoire" not in adresse and "cote d'ivoire" not in adresse:
-                # on accepte quand même si c'est le premier résultat pertinent
-                pass
-            resultat = {
+            d_ref = distance_m(lat, lon, ref[0], ref[1]) if ref else 0
+            valides.append((d_ref, {
                 "nom": titre,
-                "latitude": float(lat),
-                "longitude": float(lon),
+                "latitude": lat,
+                "longitude": lon,
                 "alternatives": [],
-            }
+            }))
+
+        if valides:
+            if ref:
+                valides.sort(key=lambda x: x[0])
+            resultat = valides[0][1]
             cache_set(cle, resultat)
             return resultat
 
@@ -241,6 +266,8 @@ def suggestions_lieu(lieu: str, limite: int = 8) -> list:
                 coords = r.get("gps_coordinates") or {}
                 if not (coords.get("latitude") and coords.get("longitude")):
                     continue
+                if not _dans_zone(float(coords["latitude"]), float(coords["longitude"])):
+                    continue
                 nom = r.get("title") or "lieu"
                 if nom in vus:
                     continue
@@ -276,7 +303,10 @@ def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon
         return {"nom": "ma position actuelle", "latitude": float(lat), "longitude": float(lon), "alternatives": []}
 
     if texte_net and texte_net not in ("null", "none", "aucun") and not any(m in texte_net for m in MOTS_POSITION):
-        lieu = rechercher_lieu(texte)
+        # si on a la position GPS, le lieu cherché doit être proche d'elle
+        lieu = rechercher_lieu(texte, ref=(float(lat), float(lon)) if a_gps else None)
+        if not lieu and a_gps:
+            lieu = rechercher_lieu(texte)
         if lieu:
             return lieu
 
@@ -1136,7 +1166,8 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
     """Propositions logiques et distinctes :
     1. plus petit nombre de correspondances d'abord (jamais 3-4 bus si moins suffit) ;
     2. regroupe les trajets qui partagent la même montée et le même point de correspondance ;
-    3. en mode TOUS, ajoute un autre mode UNIQUEMENT s'il reste compétitif (+50 % max)."""
+    3. en mode TOUS, ajoute un autre mode UNIQUEMENT s'il reste compétitif (+50 % max).
+    Marche au départ et à l'arrivée : 500 m maximum, sinon le trajet n'est pas proposé."""
     cands = [c for c in (candidats or []) if _etapes_transport(c)]
     if budget:
         cands = [c for c in cands if c.get("cout_partiel_fcfa", 0) <= budget]
@@ -1153,9 +1184,15 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         e = c["etapes"][-1]
         return e.get("distance_m", 0) if e.get("mode") == "MARCHE" else 0
 
-    courtes = [c for c in cands if marche_finale(c) <= SEUIL_MARCHE_LONGUE_M]
-    if courtes:
-        cands = courtes
+    def marche_debut(c):
+        e = c["etapes"][0]
+        return e.get("distance_m", 0) if e.get("mode") == "MARCHE" else 0
+
+    # jamais de marche > 500 m, ni au départ ni à l'arrivée
+    cands = [c for c in cands
+             if marche_finale(c) <= MARCHE_MAX_M and marche_debut(c) <= MARCHE_MAX_M]
+    if not cands:
+        return []
 
     def cle(c):
         base = c.get("nb_arrets", 0) + _acces_m(c) / 200.0
@@ -1705,7 +1742,8 @@ def _score_trajet(c: dict) -> int:
 
 
 def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
-    for rayon in (1500, 2500, 4000):
+    # Un seul rayon : 500 m max autour du départ et de la destination (plus d'élargissement à 4 km)
+    for rayon in (MARCHE_MAX_M,):
         resultats = _construire_candidats_rayon(dep, dest, mode_filtre, prix_max_ligne, rayon)
         if resultats:
             for c in resultats:
@@ -1792,15 +1830,8 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
     vus = set()
     meilleur_direct = {}
 
-    # Gbaka / woro-woro : on descend à moins de 500 m de la destination ; si aucun arrêt de gbaka
-    # n'est aussi proche, on prend le plus proche qui existe (+100 m de tolérance).
-    descente_max_gbaka = DESCENTE_MAX_GBAKA_M
-    if modes & {"GBAKA", "WORO_WORO"}:
-        d_min = min((distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
-                     for ar in RESEAU["arrets"].values()
-                     if any(RESEAU["lignes"].get(rid, {}).get("type") == "GBAKA"
-                            for rid in RESEAU["lignes_par_arret"].get(ar["id"], []))), default=0)
-        descente_max_gbaka = max(DESCENTE_MAX_GBAKA_M, int(d_min) + 100)
+    # Descente gbaka / woro-woro : jamais à plus de 500 m de la destination.
+    descente_max_gbaka = MARCHE_MAX_M
 
     # ── DIRECT : descente à l'arrêt de la ligne le plus proche de la destination ──
     # Boarding always at the stop on the line closest to the user (avoids skipping nearer stops)
@@ -2168,6 +2199,17 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             return bool(transports) and transports[-1]["mode"] in ("GBAKA", "WORO_WORO") \
                 and fin["mode"] == "MARCHE" and fin.get("distance_m", 0) > descente_max_gbaka
         candidats = [c for c in candidats if not _descente_trop_loin(c)]
+
+    # Filtre de sécurité, tous modes : marche de départ ET d'arrivée <= 500 m
+    # (couvre aussi le repli par noms du catalogue)
+    def _marche_ok(c):
+        et = c["etapes"]
+        if et and et[0]["mode"] == "MARCHE" and et[0].get("distance_m", 0) > MARCHE_MAX_M:
+            return False
+        if et and et[-1]["mode"] == "MARCHE" and et[-1].get("distance_m", 0) > MARCHE_MAX_M:
+            return False
+        return True
+    candidats = [c for c in candidats if _marche_ok(c)]
 
     if modes == {"GBAKA"}:
         candidats = _filtrer_trajets_gbaka(candidats)
@@ -3196,8 +3238,8 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
             lib = _LIBELLE_MODE.get(mode, mode.lower())
             return (f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux. "
                     f"Tu veux que je cherche en bus, en gbaka ou avec tous les modes ?")
-        return ("Je n'ai trouvé aucun trajet pour l'instant. Vérifie ton départ et ta destination, "
-                "ou essaie un autre mode de transport.")
+        return ("Je n'ai trouvé aucun arrêt de bus à moins de 500 m de ton départ ou de ta destination "
+                "avec une ligne qui les relie. Essaie un lieu proche ou un autre mode de transport.")
 
     combo = candidats[0].get("combo_mode")
     if combo:
