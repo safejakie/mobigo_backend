@@ -42,7 +42,9 @@ from ml_mobigo import (
 )
 charger_modele()
 
-app = FastAPI(title="MobiGo API", version="2.4.0")
+# ⚠️ La ligne "import memoire" a été retirée.
+
+app = FastAPI(title="MobiGo API", version="2.4.0") # Version mise à jour
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -356,7 +358,12 @@ def construire_contexte_session(session_id: str, demande) -> dict:
 def assistant_chat(demande: Demande):
     session_id = demande.session_id or "default"
     
+    # ⚠️ Le bloc de restauration de la base de données a été retiré.
+    # L'historique vient directement de Flutter (demande.historique).
+    
     message = _separer_contexte(demande.message.strip(), session_id, demande.contexte)
+    
+    # ⚠️ La sauvegarde du message utilisateur dans la base a été retirée.
     
     analyse = analyser_intention(message, demande.historique, session_id=session_id)
     intention = analyse["intention"]
@@ -366,6 +373,7 @@ def assistant_chat(demande: Demande):
              intention, mode_transport, analyse.get("mode_precise"))
 
     def repondre(texte: str, **kw) -> ChatResponse:
+        # ⚠️ La sauvegarde de la réponse dans la base et de la session a été retirée.
         return ChatResponse(demande=message, intention=kw.pop("intention", intention),
                             reponse=texte,
                             contexte=_contexte_reponse(session_id), **kw)
@@ -409,137 +417,129 @@ def assistant_chat(demande: Demande):
 
     #  TRAJET / LIGNES_TRAJET 
     if intention in ("TRAJET", "LIGNES_TRAJET"):
-        # ⚠️ NOUVEAU : Bloc try/except pour attraper les erreurs de calcul de trajet
+        dep_texte = analyse.get("depart") or ""
+        dest_texte = analyse.get("destination") or ""
+        maj_session(session_id, analyse)
+
         try:
-            dep_texte = analyse.get("depart") or ""
-            dest_texte = analyse.get("destination") or ""
-            maj_session(session_id, analyse)
+            gps = coordonnees_gps_obligatoires(demande.depart_lat, demande.depart_lon, dep_texte)
+        except HTTPException:
+            return repondre("Je n'ai pas accès à ta position. Active la localisation "
+                            "ou dis-moi d'où tu pars 😊")
 
-            try:
-                gps = coordonnees_gps_obligatoires(demande.depart_lat, demande.depart_lon, dep_texte)
-            except HTTPException:
-                return repondre("Je n'ai pas accès à ta position. Active la localisation "
-                                "ou dis-moi d'où tu pars 😊")
+        if not dest_texte:
+            return repondre("Vers quel quartier ou lieu veux-tu aller exactement ? 😊")
+        if not dep_texte and not gps:
+            return repondre("D'où pars-tu ? Dis-moi un quartier ou un lieu "
+                            "(ou active ta position) 😊")
 
-            if not dest_texte:
-                return repondre("Vers quel quartier ou lieu veux-tu aller exactement ? 😊")
-            if not dep_texte and not gps:
-                return repondre("D'où pars-tu ? Dis-moi un quartier ou un lieu "
-                                "(ou active ta position) 😊")
+        if gps and (not dep_texte or est_position_actuelle(dep_texte)):
+            dep = {"nom": "ma position actuelle",
+                   "latitude": demande.depart_lat, "longitude": demande.depart_lon}
+        else:
+            dep = rechercher_lieu(dep_texte)
 
-            if gps and (not dep_texte or est_position_actuelle(dep_texte)):
-                dep = {"nom": "ma position actuelle",
-                       "latitude": demande.depart_lat, "longitude": demande.depart_lon}
-            else:
-                dep = rechercher_lieu(dep_texte)
+        if (demande.dest_lat is None) != (demande.dest_lon is None):
+            raise HTTPException(status_code=422,
+                                detail="Les deux coordonnées GPS de la destination sont obligatoires.")
+        if demande.dest_lat is not None and demande.dest_lon is not None:
+            dest = {"nom": dest_texte, "latitude": demande.dest_lat, "longitude": demande.dest_lon}
+        else:
+            dest = rechercher_lieu(dest_texte)
 
-            if (demande.dest_lat is None) != (demande.dest_lon is None):
-                raise HTTPException(status_code=422,
-                                    detail="Les deux coordonnées GPS de la destination sont obligatoires.")
-            if demande.dest_lat is not None and demande.dest_lon is not None:
-                dest = {"nom": dest_texte, "latitude": demande.dest_lat, "longitude": demande.dest_lon}
-            else:
-                dest = rechercher_lieu(dest_texte)
+        if not dep or not dest:
+            return repondre("Je n'ai pas trouvé ces lieux. Tu peux me les préciser ? 😊")
 
-            if not dep or not dest:
-                return repondre("Je n'ai pas trouvé ces lieux. Tu peux me les préciser ? 😊")
+        prix_max = analyse.get("prix_max_ligne")
+        budget = analyse.get("budget_fcfa")
 
-            prix_max = analyse.get("prix_max_ligne")
-            budget = analyse.get("budget_fcfa")
+        proches = arrets_proches_trajet(dep, dest, mode_transport)
+        candidats = candidats_multimodaux(dep, dest, mode_transport, prix_max)
 
-            proches = arrets_proches_trajet(dep, dest, mode_transport)
-            candidats = candidats_multimodaux(dep, dest, mode_transport, prix_max)
+        signatures_exclues = {
+            tuple(signature) for signature in (analyse.get("exclure_signatures") or [])
+        }
+        if signatures_exclues:
+            candidats = [
+                c for c in candidats
+                if tuple((e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
+                          e.get("depart"), e.get("arrivee"))
+                         for e in c.get("etapes", []) if e.get("mode") != "MARCHE")
+                not in signatures_exclues
+            ]
 
-            signatures_exclues = {
-                tuple(signature) for signature in (analyse.get("exclure_signatures") or [])
-            }
-            if signatures_exclues:
-                candidats = [
-                    c for c in candidats
-                    if tuple((e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
-                              e.get("depart"), e.get("arrivee"))
-                             for e in c.get("etapes", []) if e.get("mode") != "MARCHE")
-                    not in signatures_exclues
-                ]
+        contexte = construire_contexte(dep, dest) or {}
+        candidats = ajuster_candidats(candidats, contexte)
 
-            contexte = construire_contexte(dep, dest) or {}
-            candidats = ajuster_candidats(candidats, contexte)
+        tous = list(candidats)
+        candidats = trajets_pour_demande(candidats, analyse.get("priorite"), prix_max, budget)
 
-            tous = list(candidats)
-            candidats = trajets_pour_demande(candidats, analyse.get("priorite"), prix_max, budget)
-
-            if not tous:
-                p_dep = proches["depart"][0] if proches["depart"] else None
-                p_arr = proches["arrivee"][0] if proches["arrivee"] else None
-                infos = []
-                if p_dep:
-                    infos.append(f"l'arrêt le plus proche de ton départ est {p_dep['nom']} "
-                                 f"(~{p_dep['distance_m']} m)")
-                if p_arr:
-                    infos.append(f"celui de ta destination est {p_arr['nom']} "
-                                 f"(~{p_arr['distance_m']} m)")
-                detail = (" Pour info, " + " et ".join(infos) + ".") if infos else ""
-                message_aucun = (
-                    "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet."
-                    if signatures_exclues else
-                    "Oups 😅 je ne trouve pas de trajet direct dans ce mode entre ces deux lieux."
-                )
-                return repondre(
-                    message_aucun + detail +
-                    " Tu veux que j'essaie avec un autre mode (gbaka, bus, bateau-bus) ?",
-                    depart=Lieu(**dep), destination=Lieu(**dest),
-                    arrets_depart=proches["depart"],
-                    arrets_destination=proches["arrivee"],
-                )
-
-            if tous and not candidats and budget:
-                moins_cher = min(c.get("cout_partiel_fcfa", 0) for c in tous)
-                maj_session(session_id, analyse, attente_mode=False)
-                return repondre(
-                    f"Avec {budget} FCFA, je ne trouve aucun trajet 😕. "
-                    f"Le moins cher que je connais coûte environ {moins_cher} FCFA. "
-                    f"Tu veux augmenter un peu ton budget ?",
-                    depart=Lieu(**dep), destination=Lieu(**dest), budget_fcfa=budget,
-                )
-
-            options = choisir_propositions(candidats, mode_transport,
-                                            analyse.get("priorite"), budget, maxi=4)
-            principal = options[0] if options else None
-            maj_session(session_id, analyse, trajet=principal, attente_mode=False)
-            SESSIONS[session_id]["dernieres_options"] = options
-
-            contexte_llm = {
-                **contexte,
-                "statut": "TRAJET",
-                "candidats": options,
-                "mode": mode_transport,
-                "prix_max_ligne": prix_max,
-                "budget_fcfa": budget,
-                "conseil_marche": conseil_marche_chat(options),
-                "arrets_proches": {k: [{"nom": a["nom"], "distance_m": a["distance_m"]}
-                                        for a in v[:3]]
-                                    for k, v in proches.items()},
-            }
-            reponse = generer_reponse(message, contexte_llm, demande.historique,
-                                       session_id=session_id)
-
+        if not tous:
+            p_dep = proches["depart"][0] if proches["depart"] else None
+            p_arr = proches["arrivee"][0] if proches["arrivee"] else None
+            infos = []
+            if p_dep:
+                infos.append(f"l'arrêt le plus proche de ton départ est {p_dep['nom']} "
+                             f"(~{p_dep['distance_m']} m)")
+            if p_arr:
+                infos.append(f"celui de ta destination est {p_arr['nom']} "
+                             f"(~{p_arr['distance_m']} m)")
+            detail = (" Pour info, " + " et ".join(infos) + ".") if infos else ""
+            message_aucun = (
+                "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet."
+                if signatures_exclues else
+                "Oups 😅 je ne trouve pas de trajet direct dans ce mode entre ces deux lieux."
+            )
             return repondre(
-                reponse,
-                depart=Lieu(**dep),
-                destination=Lieu(**dest),
-                trajets=options,
+                message_aucun + detail +
+                " Tu veux que j'essaie avec un autre mode (gbaka, bus, bateau-bus) ?",
+                depart=Lieu(**dep), destination=Lieu(**dest),
                 arrets_depart=proches["depart"],
                 arrets_destination=proches["arrivee"],
-                instructions=instructions_trajet(principal) if principal else [],
-                trajet=principal,
-                budget_fcfa=budget,
             )
-        except Exception as e:
-            log.error("Erreur interne lors du calcul du trajet : %s", e)
+
+        if tous and not candidats and budget:
+            moins_cher = min(c.get("cout_partiel_fcfa", 0) for c in tous)
+            maj_session(session_id, analyse, attente_mode=False)
             return repondre(
-                "Oups, j'ai rencontré une petite erreur technique en cherchant ton trajet. "
-                "Vérifie tes lieux de départ et d'arrivée, puis réessaie ! 😊"
+                f"Avec {budget} FCFA, je ne trouve aucun trajet 😕. "
+                f"Le moins cher que je connais coûte environ {moins_cher} FCFA. "
+                f"Tu veux augmenter un peu ton budget ?",
+                depart=Lieu(**dep), destination=Lieu(**dest), budget_fcfa=budget,
             )
+
+        options = choisir_propositions(candidats, mode_transport,
+                                        analyse.get("priorite"), budget, maxi=4)
+        principal = options[0] if options else None
+        maj_session(session_id, analyse, trajet=principal, attente_mode=False)
+        SESSIONS[session_id]["dernieres_options"] = options
+
+        contexte_llm = {
+            **contexte,
+            "statut": "TRAJET",
+            "candidats": options,
+            "mode": mode_transport,
+            "prix_max_ligne": prix_max,
+            "budget_fcfa": budget,
+            "conseil_marche": conseil_marche_chat(options),
+            "arrets_proches": {k: [{"nom": a["nom"], "distance_m": a["distance_m"]}
+                                    for a in v[:3]]
+                                for k, v in proches.items()},
+        }
+        reponse = generer_reponse(message, contexte_llm, demande.historique,
+                                   session_id=session_id)
+
+        return repondre(
+            reponse,
+            depart=Lieu(**dep),
+            destination=Lieu(**dest),
+            trajets=options,
+            arrets_depart=proches["depart"],
+            arrets_destination=proches["arrivee"],
+            instructions=instructions_trajet(principal) if principal else [],
+            trajet=principal,
+            budget_fcfa=budget,
+        )
 
     return repondre("Je suis MobiGuide. Dis-moi où tu veux aller ! 😊", intention="INCONNUE")
 
