@@ -128,46 +128,66 @@ def est_gare(nom: str) -> bool:
     return any(g in n for g in NOMS_GARES if g != "gare")
 
 
-# geocodage 
+# geocodage – amélioré pour lieux locaux (Azito, etc.)
 
 def rechercher_lieu(lieu: Optional[str]):
     if not lieu:
         return None
-    cle = ("geo", lieu.strip().lower())
+    lieu_clean = lieu.strip()
+    if not lieu_clean:
+        return None
+    cle = ("geo", lieu_clean.lower())
     deja = cache_get(cle)
     if deja:
         return deja
 
-    try:
-        res = serpapi.search({
-            "api_key": SERPAPI_KEY,
-            "engine": "google_maps",
-            "type": "search",
-            "q": f"{lieu}, Abidjan, Cote d'Ivoire",
-            "ll": CENTRE_ABIDJAN,
-            "hl": "fr",
-            "gl": "ci",
-        }).as_dict()
-    except Exception as e:
-        log.error("erreur serpapi : %s", e)
-        return None
+    queries = [
+        f"{lieu_clean}, Abidjan, Côte d'Ivoire",
+        f"{lieu_clean}, Abidjan",
+        f"{lieu_clean} Abidjan",
+    ]
 
-    candidats = []
-    if res.get("place_results"):
-        candidats.append(res["place_results"])
-    candidats += res.get("local_results", [])
+    for q in queries:
+        try:
+            res = serpapi.search({
+                "api_key": SERPAPI_KEY,
+                "engine": "google_maps",
+                "type": "search",
+                "q": q,
+                "ll": CENTRE_ABIDJAN,
+                "hl": "fr",
+                "gl": "ci",
+            }).as_dict()
+        except Exception as e:
+            log.error("erreur serpapi : %s", e)
+            continue
 
-    for r in candidats:
-        coords = r.get("gps_coordinates") or {}
-        if coords.get("latitude") and coords.get("longitude"):
+        candidats = []
+        if res.get("place_results"):
+            candidats.append(res["place_results"])
+        candidats += res.get("local_results", []) or []
+
+        for r in candidats:
+            coords = r.get("gps_coordinates") or {}
+            lat = coords.get("latitude")
+            lon = coords.get("longitude")
+            if lat is None or lon is None:
+                continue
+            titre = (r.get("title") or lieu_clean).strip()
+            # on évite les résultats trop vagues ou hors Abidjan si possible
+            adresse = (r.get("address") or "").lower()
+            if "abidjan" not in adresse and "côte d'ivoire" not in adresse and "cote d'ivoire" not in adresse:
+                # on accepte quand même si c'est le premier résultat pertinent
+                pass
             resultat = {
-                "nom": r.get("title") or lieu,
-                "latitude": float(coords["latitude"]),
-                "longitude": float(coords["longitude"]),
+                "nom": titre,
+                "latitude": float(lat),
+                "longitude": float(lon),
                 "alternatives": [],
             }
             cache_set(cle, resultat)
             return resultat
+
     return None
 
 
@@ -192,7 +212,7 @@ def suggestions_lieu(lieu: str, limite: int = 8) -> list:
         if arret["id"] in RESEAU["points_libres"]:
             continue
         nom_nettoye = nettoyer_texte(arret["nom"])
-        if texte_nettoye in nom_nettoye:
+        if texte_nettoye in nom_nettoye or any(m in nom_nettoye for m in texte_nettoye.split() if len(m) > 3):
             if arret["nom"] in vus:
                 continue
             vus.add(arret["nom"])
@@ -211,7 +231,7 @@ def suggestions_lieu(lieu: str, limite: int = 8) -> list:
                 "api_key": SERPAPI_KEY,
                 "engine": "google_maps",
                 "type": "search",
-                "q": f"{lieu}, Abidjan, Cote d'Ivoire",
+                "q": f"{lieu}, Abidjan, Côte d'Ivoire",
                 "ll": CENTRE_ABIDJAN,
                 "hl": "fr",
                 "gl": "ci",
@@ -3011,7 +3031,10 @@ SYSTEME_TRAJET = (
     "Tu es MobiGuide, assistant de transport à Abidjan, chaleureux et naturel, comme un ami qui "
     "connaît bien la ville. Tu réponds toujours en français. Tu ne répètes jamais une formule "
     "d'accueil ni un conseil déjà dit dans la conversation. Tu n'inventes jamais de prix ni "
-    "d'arrêt et tu ne renvoies jamais vers Google Maps ou Waze."
+    "d'arrêt et tu ne renvoies jamais vers Google Maps ou Waze. "
+    "Quand un mode de transport est demandé (bateau-bus, bus, gbaka) et qu'aucun trajet n'existe "
+    "dans ce mode, dis-le clairement et propose d'autres modes uniquement si l'utilisateur le demande. "
+    "Ne dis jamais « il n'y a pas de trajet en bateau-bus » puis propose encore des trajets qui contiennent du bateau-bus."
 )
 
 
@@ -3169,6 +3192,10 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
         if _EXCLURE.get():
             return ("Je n'ai pas d'autre trajet vraiment différent entre ces deux lieux. "
                     "Tu veux essayer un autre mode (bus, gbaka, bateau-bus) ?")
+        if mode and mode != "TOUS":
+            lib = _LIBELLE_MODE.get(mode, mode.lower())
+            return (f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux. "
+                    f"Tu veux que je cherche en bus, en gbaka ou avec tous les modes ?")
         return ("Je n'ai trouvé aucun trajet pour l'instant. Vérifie ton départ et ta destination, "
                 "ou essaie un autre mode de transport.")
 
