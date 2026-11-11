@@ -1,4 +1,3 @@
-"""services mobigo sans otp — v3 (mémoire, mode strict, warm + advice)"""
 import csv
 import json
 import os
@@ -19,8 +18,7 @@ from config import (
     cache_get, cache_set, distance_m, log,
 )
 
-# ── outils texte ─────────────────────────────────────────────────────
-
+# outils texte 
 def nettoyer_texte(texte: str) -> str:
     if not texte:
         return ""
@@ -68,7 +66,7 @@ def _point_proche_du_trace(lat: float, lon: float, trace: list, bbox, seuil_m: f
     return False
 
 
-# ── parsing des champs CSV gbaka/woro ───────────────────────────────
+# parsing des champs CSV gbaka/woro 
 
 def _parse_liste_arrets(liste_str: str) -> list:
     if not liste_str or not isinstance(liste_str, str):
@@ -103,7 +101,7 @@ def _parse_coords_str(coords_str: str) -> list:
     return out
 
 
-# ── gares ────────────────────────────────────────────────────────────
+# gares 
 
 NOMS_GARES = [
     "gare", "gare nord", "gare sud", "gare routiere",
@@ -130,7 +128,7 @@ def est_gare(nom: str) -> bool:
     return any(g in n for g in NOMS_GARES if g != "gare")
 
 
-# ── geocodage ───────────────────────────────────────────────────────
+# geocodage 
 
 def rechercher_lieu(lieu: Optional[str]):
     if not lieu:
@@ -267,7 +265,7 @@ def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon
     return None
 
 
-# ── donnees ─────────────────────────────────────────────────────────
+# donnees 
 
 CATALOGUE = []
 RESEAU = {
@@ -411,7 +409,7 @@ def charger_catalogue():
     log.info("catalogue charge : %d lignes", len(CATALOGUE))
 
 
-# ── sequences d arrets ──────────────────────────────────────────────
+# sequences d arrets 
 
 def _dist_rapide(lat1, lon1, lat2, lon2) -> float:
     dy = (lat1 - lat2) * 111320.0
@@ -870,7 +868,7 @@ def charger_reseau_local():
         )
 
 
-# ── arrets a proximite ──────────────────────────────────────────────
+# arrets a proximite 
 
 def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distance: bool = False) -> List[dict]:
     if not RESEAU["charge"]:
@@ -960,7 +958,7 @@ def lignes_par_arret(stop_id: str) -> Optional[dict]:
     return {"arret": arret, "lignes": lignes}
 
 
-# ── Prix (lecture CSV uniquement) ───────────────────────────────────
+# Prix (lecture CSV uniquement) 
 
 PRIX_CATALOGUE = {}
 _prix_charges = False
@@ -1112,7 +1110,7 @@ def _quasi_identiques(a: dict, b: dict) -> bool:
     return True
 
 
-# ═══════════════ choisir_propositions (Option 1 · bus X puis bus Y) ═══════════════
+# choisir_propositions (Option 1 · bus X puis bus Y) 
 def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
                           priorite=None, budget=None, maxi: int = 4) -> list:
     """Propositions logiques et distinctes :
@@ -1230,8 +1228,6 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         resultat.append(rep)
     return resultat
 
-
-# ── Remarque : choisir_options (Rapide/Recommandé/Économique) est SUPPRIMÉE ──
 
 
 def _normaliser_candidat(c: dict):
@@ -1364,7 +1360,7 @@ def _segment_sur_ligne(sequence: list, montee_id: str, descente_id: str):
     return sequence[i:apres[0] + 1]
 
 
-# ═══════════════ _arrets_utiles — équilibre PAR MODE ═══════════════
+# _arrets_utiles — équilibre PAR MODE 
 def _arrets_utiles(arrets: list, modes: set, maxi: int = 60) -> list:
     """Garde les arrêts utiles pour le routage, en assurant une représentation
     de CHAQUE mode (sinon, entouré de bus, aucun gbaka / bateau-bus n'est retenu
@@ -1729,7 +1725,7 @@ def _filtrer_trajets_gbaka(candidats: list) -> list:
     return uniques
 
 
-# ═══════════════ _construire_candidats_rayon (descente logique + limits) ═══════════════
+#  (descente logique + limits)
 def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                                  prix_max_ligne, rayon: int) -> List[dict]:
     if not RESEAU["charge"]:
@@ -2245,7 +2241,7 @@ def passages_gbaka_pres_de(lat: float, lon: float, rayon_m: int = 800) -> List[d
     return resultats
 
 
-# ── frontend ────────────────────────────────────────────────────────
+# frontend 
 
 def prix_connu(mode, nom_ligne, montee, descente, numero):
     if numero and str(numero) in PRIX_LIGNES:
@@ -2365,7 +2361,7 @@ def _score_nom(cible: str, nom: str) -> float:
     return ok / len(mots_c)
 
 
-# ═══════════════ _sens_ligne_bus — corrige le bug 85 ═══════════════
+#  _sens_ligne_bus — corrige le bug 85
 def _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero) -> list:
     """Aller / retour d'une ligne BUS/BATEAU.
     PRIORITÉ au cat:{index} (séquence propre au CSV : deux lignes partageant
@@ -2647,7 +2643,7 @@ def _texte_trajet(candidat, mode="TOUS"):
     return " puis ".join(parts) + f" (environ {candidat.get('duree_minutes')} min)"
 
 
-# ── agent ia ────────────────────────────────────────────────────────
+# agent ia
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -2682,6 +2678,10 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
     attente = bool(s.get("attente_mode"))
     mode_msg = extraire_mode(message, accepter_tous=attente)
     budget_msg = extraire_budget(message)
+
+    if re.search(r"(comment (tu|vous) (t|vous )?.?appel|qui (es|etes).?(tu|vous)|tu es qui|ton nom|"
+                 r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", nettoyer_texte(message)):
+        return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
 
     if s.get("dernieres_options") and re.search(
             r"(pas convaincu|ne me convient pas|ça ne me convient pas|ca ne me convient pas|"
@@ -2726,8 +2726,7 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
         }
 
     if budget_msg and s.get("destination") and (s.get("depart") or s.get("dernieres_options")) \
-            and len(message.split()) <= 14 and "?" not in message \
-            and not re.search(r"\bcombien\b|c.?est quoi|\bpourquoi\b", nettoyer_texte(message)):
+            and not re.search(r"\bcombien\b|c.?est quoi|\bpourquoi\b|\bcomment fonctionne\b", nettoyer_texte(message)):
         mode_session = s.get("mode_transport")
         return {
             "intention": "TRAJET", "depart": s.get("depart"),
@@ -2931,9 +2930,11 @@ def _valeur_vide(v) -> bool:
     return v is None or (isinstance(v, str) and v.strip().lower() in ("", "null", "none", "aucun"))
 
 
-# ═══════════════ _completer_analyse — pas de réutilisation du mode pour une nouvelle demande ═══════════════
+#  _completer_analyse — pas de réutilisation du mode pour une nouvelle demande
 def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
     data.setdefault("intention", "INCONNUE")
+    if data["intention"] == "INCONNUE":
+        data["intention"] = "CONVERSATION"   # jamais de réponse figée : on discute normalement
     if data["intention"] == "SUIVI" and not s.get("dernieres_options"):
         data["intention"] = "CONVERSATION"
     data.setdefault("depart", None)
@@ -2952,7 +2953,7 @@ def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
             data["mode_transport"], data["mode_precise"] = mode_msg, True
         elif s.get("mode_demande"):
             data["mode_precise"] = True  # déjà demandé plus tôt : on ne repose pas la question, tous les modes
-        # ⚠️ On ne réutilise PAS le mode de session pour une nouvelle demande :
+        # On ne réutilise PAS le mode de session pour une nouvelle demande :
         # si l'utilisateur ne précise pas le mode, on cherche dans TOUS les modes.
         data["budget_fcfa"] = budget_msg or s.get("budget_fcfa")
     return data
@@ -2999,6 +3000,8 @@ SYSTEME_AMI = (
     "pas tout aux trajets. Tu ne répètes jamais une formule d'accueil (« avec plaisir », « bonne "
     "nouvelle »...) ni un conseil que tu as déjà donné plus haut dans la conversation : tu varies et "
     "tu réponds précisément à ce que l'utilisateur demande maintenant. "
+    "Tu t'appelles MobiGuide, l'assistant de l'application MobiGo. Tu es toujours accueillant, chaleureux et tu "
+    "guides l'utilisateur ; tu ne refuses jamais de répondre à une question simple. "
     "Si tu ne connais pas la réponse, dis-le clairement et demande une précision ; "
     "n'invente jamais une information, une ligne, un prix ou une fonctionnalité."
 )
@@ -3037,6 +3040,18 @@ def _conseils_liste(options: list, budget=None) -> list:
 
 def conseils_trajet(options: list, budget=None) -> str:
     return " ".join(t for _, t in _conseils_liste(options, budget))
+
+
+def _phrase_complete(texte: str, fini_par_limite: bool) -> str:
+    """Si le LLM a été coupé (max_tokens), on garde seulement les phrases terminées."""
+    texte = (texte or "").strip()
+    if not fini_par_limite or not texte:
+        return texte
+    fin = max(texte.rfind(c) for c in ".!?…")
+    emoji = re.search(r"[.!?…][^\w\s]{0,3}\s*$", texte)
+    if emoji:
+        return texte
+    return texte[:fin + 1].strip() if fin > 20 else texte
 
 
 def _habiller_reponse(texte: str, options: list, budget=None) -> str:
@@ -3134,10 +3149,11 @@ def _intro_trajet(message: str, contexte: dict, candidats: list, mode: str,
         r = client.chat.completions.create(
             model=MODEL,
             messages=_messages_llm(SYSTEME_TRAJET + memoire_txt, prompt, historique),
-            temperature=0.6, max_tokens=80,
+            temperature=0.6, max_tokens=140,
         )
         texte = (r.choices[0].message.content or "").strip().strip('"').strip()
         texte = texte.split("\n")[0].strip()
+        texte = _phrase_complete(texte, r.choices[0].finish_reason == "length")
         return texte or modele
     except Exception as e:
         log.error("erreur intro trajet : %s", e)
@@ -3165,6 +3181,8 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
         intro = _intro_trajet(message, contexte, candidats, mode, historique, premiere,
                               memoire_txt, infos_conditions)
 
+    if budget and extraire_budget(message) == budget:
+        intro += f" Tous ces trajets respectent ton budget de {budget} FCFA."
     parts = [intro, "Option 1 :\n" + decrire_trajet(candidats[0])]
     autres = len(candidats) - 1
     if autres > 0:
@@ -3180,7 +3198,7 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
     return "\n\n".join(parts)
 
 
-# ═══════════════ generer_reponse — naturel, sans répétition ═══════════════
+#  generer_reponse — naturel, sans répétition 
 def generer_reponse(message: str, contexte: dict, historique: list = None,
                     session_id: str = None) -> str:
     historique = historique or []
@@ -3235,11 +3253,13 @@ que s'il est nouveau et vraiment utile. Ne recopie pas tout l'itinéraire, n'inv
 Utilise UNIQUEMENT ces infos pour trafic / météo, ne renvoie jamais vers Google Maps ou Waze,
 donne un conseil concret en 2-3 phrases maximum."""
         else:
-            prompt = f"""Réponds directement à la question suivante : {message}
+            prompt = f"""{message}
 
-Si cette question ne concerne pas les transports ou dépasse tes données, dis honnêtement que tu ne peux pas
-la traiter et explique brièvement ce que tu peux faire. Ne renvoie pas automatiquement une carte de trajet.
-Réponds en français, avec chaleur, en 2 ou 3 phrases maximum, sans répéter ce que tu as déjà dit."""
+Réponds directement et naturellement à ce message, comme un ami chaleureux, en 2 ou 3 phrases maximum.
+Si on te demande ton nom ou qui tu es : tu es MobiGuide, l'assistant de l'application MobiGo pour se déplacer à Abidjan.
+Pour une question hors transport (culture générale, blague, conseil...), réponds-y vraiment ; ne dis jamais que tu
+ne réponds pas à ce genre de questions. Termine, quand c'est naturel, par une courte invitation à t'aider pour un trajet
+(sans imposer de position ni d'itinéraire). Ne répète pas ce que tu as déjà dit."""
     else:
         systeme = SYSTEME_AMI + memoire_txt
         prompt = message
@@ -3248,9 +3268,10 @@ Réponds en français, avec chaleur, en 2 ou 3 phrases maximum, sans répéter c
         reponse = client.chat.completions.create(
             model=MODEL,
             messages=_messages_llm(systeme, prompt, historique),
-            temperature=0.5, max_tokens=350,
+            temperature=0.5, max_tokens=600,
         )
-        return reponse.choices[0].message.content.strip()
+        return _phrase_complete(reponse.choices[0].message.content,
+                                reponse.choices[0].finish_reason == "length")
     except Exception as e:
         log.error("erreur generation reponse : %s", e)
         return "Je suis MobiGuide. Dis-moi où tu veux aller et je te propose un trajet."
