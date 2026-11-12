@@ -1,14 +1,15 @@
+import copy
+import contextvars
 import csv
+import difflib
+import functools
 import json
-import math
 import os
 import re
 import threading
 import unicodedata
-import copy
-import contextvars
 from collections import Counter, defaultdict
-from typing import Optional, List
+from typing import List, Optional
 
 import serpapi
 from groq import Groq
@@ -19,1058 +20,716 @@ from config import (
     cache_get, cache_set, distance_m, log,
 )
 
-# outils texte 
+# ── RÉGLAGES (on les change ici, à un seul endroit) ──────────────────────────
+DESCENTE_MAX_M = 1000          # on descend à 1000 m maximum de la destination
+DESCENTE_MAX_GBAKA_M = 500     # un gbaka dépose plus près (500 m)
+RAYON_DEPART_M = 1500          # on cherche les arrêts de départ dans ce rayon
+SEUIL_MARCHE_LONGUE_M = 1000   # au-delà, on conseille un taxi / woro-woro
+ATTENTE_MINUTES = {"BUS": 8, "GBAKA": 3, "WORO_WORO": 3, "BATEAU": 15}
+NOM_MODE = {"BUS": "bus", "GBAKA": "gbaka", "WORO_WORO": "woro-woro", "BATEAU": "bateau-bus"}
+# Cadre géographique d'Abidjan : un lieu trouvé hors de ce cadre est refusé.
+ABIDJAN_LAT = (5.15, 5.65)
+ABIDJAN_LON = (-4.35, -3.75)
+
+# ── 1. OUTILS ──
 def nettoyer_texte(texte: str) -> str:
+    """Minuscules + sans accents : « Adjamé » devient « adjame »."""
     if not texte:
         return ""
     texte = unicodedata.normalize("NFD", str(texte).lower())
     return "".join(c for c in texte if unicodedata.category(c) != "Mn")
 
-
 def extraire_mots(texte: str) -> list:
-    mots_vides = {"de", "du", "des", "d", "l", "la", "le", "les", "a", "au", "abidjan"}
-    return [m for m in re.findall(r"\w+", nettoyer_texte(texte)) if m not in mots_vides]
-
+    """Les mots importants d'un texte (sans « de », « la », « abidjan »...)."""
+    vides = {"de", "du", "des", "d", "l", "la", "le", "les", "a", "au", "abidjan"}
+    return [m for m in re.findall(r"\w+", nettoyer_texte(texte)) if m not in vides]
 
 def _charger_trace(trace_wkt, max_points: int = 1000):
+    """Lit un tracé « LINESTRING(lon lat, ...) » -> (liste de (lat, lon), cadre min/max)."""
     if not trace_wkt or not isinstance(trace_wkt, str):
         return [], None
-    try:
-        coords = re.findall(r"(-?\d+\.?\d+)\s+(-?\d+\.?\d+)", trace_wkt)
-        if not coords:
-            return [], None
-        points = [(float(lat), float(lon)) for lon, lat in coords]
-        if not points:
-            return [], None
-        if len(points) > max_points:
-            step = max(1, len(points) // max_points)
-            points = points[::step]
-        lats = [p[0] for p in points]
-        lons = [p[1] for p in points]
-        return points, (min(lats), min(lons), max(lats), max(lons))
-    except Exception:
+    paires = re.findall(r"(-?\d+\.?\d+)\s+(-?\d+\.?\d+)", trace_wkt)
+    points = [(float(lat), float(lon)) for lon, lat in paires]
+    if not points:
         return [], None
+    if len(points) > max_points:                      # on allège les tracés trop longs
+        points = points[::max(1, len(points) // max_points)]
+    lats, lons = [p[0] for p in points], [p[1] for p in points]
+    return points, (min(lats), min(lons), max(lats), max(lons))
 
-
-def _point_proche_du_trace(lat: float, lon: float, trace: list, bbox, seuil_m: float = 300) -> bool:
-    if not trace or not bbox:
-        return False
-    min_lat, min_lon, max_lat, max_lon = bbox
-    marge_deg = seuil_m / 100000.0 + 0.001
-    if not (min_lat - marge_deg <= lat <= max_lat + marge_deg):
-        return False
-    if not (min_lon - marge_deg <= lon <= max_lon + marge_deg):
-        return False
-    for tlat, tlon in trace:
-        if distance_m(lat, lon, tlat, tlon) <= seuil_m:
-            return True
-    return False
-
-
-# parsing des champs CSV gbaka/woro 
-
-def _parse_liste_arrets(liste_str: str) -> list:
-    if not liste_str or not isinstance(liste_str, str):
+def _liste_arrets(texte: str) -> list:
+    """« A → B → C » devient ['A', 'B', 'C']."""
+    if not texte or not isinstance(texte, str):
         return []
-    s = liste_str.strip()
-    if "→" in s:
-        parts = s.split("→")
-    elif "->" in s:
-        parts = s.split("->")
-    else:
-        parts = [s]
-    return [p.strip() for p in parts if p.strip()]
+    parties = re.split(r"→|->", texte)
+    return [p.strip() for p in parties if p.strip()]
 
-
-def _parse_coords_str(coords_str: str) -> list:
-    if not coords_str or not isinstance(coords_str, str):
-        return []
-    out = []
-    for pair in coords_str.split("|"):
-        pair = pair.strip()
-        if not pair:
-            continue
-        parts = [p.strip() for p in pair.split(",")]
-        if len(parts) != 2:
-            continue
-        try:
-            lon = float(parts[0])
-            lat = float(parts[1])
-            out.append((lon, lat))
-        except ValueError:
-            continue
-    return out
-
-
-# gares 
-
-NOMS_GARES = [
-    "gare", "gare nord", "gare sud", "gare routiere",
-    "gare adjame", "adjame gare", "gare d adjame",
-    "gare abobo", "abobo gare", "gare d abobo",
-    "gare cocody", "gare de cocody",
-    "gare plateau", "gare de plateau", "gare du plateau",
-    "gare treichville", "gare de treichville", "treichville gare",
-    "gare marcory", "gare de marcory", "marcory gare",
-    "gare koumassi", "gare de koumassi", "koumassi gare",
-    "gare port bouet", "gare de port bouet", "port bouet gare",
-    "gare yopougon", "gare de yopougon", "yopougon gare",
-    "gare attecoube", "gare d attecoube", "attecoube gare",
-    "gare bassam", "gare de bassam",
-]
-
+def _liste_coords(texte: str) -> list:
+    """« lon,lat | lon,lat » devient [(lon, lat), ...]."""
+    sortie = []
+    for paire in (texte or "").split("|"):
+        morceaux = [p.strip() for p in paire.split(",")]
+        if len(morceaux) == 2:
+            try:
+                sortie.append((float(morceaux[0]), float(morceaux[1])))
+            except ValueError:
+                pass
+    return sortie
 
 def est_gare(nom: str) -> bool:
-    n = nettoyer_texte(nom or "")
-    if not n:
-        return False
-    if "gare" in n:
-        return True
-    return any(g in n for g in NOMS_GARES if g != "gare")
+    """Vrai si le nom parle d'une gare (« gare d'Adjamé », « Adjamé gare »...)."""
+    return "gare" in nettoyer_texte(nom or "")
 
+# ── 2. LIEUX : Google Maps (SerpAPI) d'abord, nos arrêts locaux en secours ──
+def _dans_abidjan(lat, lon) -> bool:
+    return ABIDJAN_LAT[0] <= lat <= ABIDJAN_LAT[1] and ABIDJAN_LON[0] <= lon <= ABIDJAN_LON[1]
 
-# geocodage – amélioré pour lieux locaux (Azito, etc.)
+def _google_maps(requete: str) -> list:
+    """Interroge Google Maps (via SerpAPI). Retourne [{nom, adresse, latitude, longitude}]
+    en gardant seulement les résultats situés dans Abidjan."""
+    try:
+        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps", "type": "search",
+                              "q": requete, "ll": CENTRE_ABIDJAN, "hl": "fr", "gl": "ci"}).as_dict()
+    except Exception as e:
+        log.error("erreur serpapi : %s", e)
+        return []
+    bruts = ([res["place_results"]] if res.get("place_results") else []) + (res.get("local_results") or [])
+    sortie = []
+    for r in bruts:
+        c = r.get("gps_coordinates") or {}
+        if c.get("latitude") is None or c.get("longitude") is None:
+            continue
+        lat, lon = float(c["latitude"]), float(c["longitude"])
+        if _dans_abidjan(lat, lon):
+            sortie.append({"nom": (r.get("title") or "lieu").strip(), "adresse": r.get("address") or "",
+                           "latitude": lat, "longitude": lon})
+    return sortie
+
+def _lieu_dans_nos_arrets(lieu: str):
+    """Secours : cherche le lieu dans les NOMS de nos arrêts (ex : « Azito » -> « Shell Azito »).
+    Accepte les petites fautes de frappe (« Zitoa »). Retourne le centre des arrêts trouvés."""
+    if not RESEAU["charge"]:
+        charger_reseau_local()
+    mots = [m for m in extraire_mots(lieu) if len(m) >= 3]
+    if not mots:
+        return None
+    trouves = []
+    for a in RESEAU["arrets"].values():
+        if a["id"] in RESEAU["points_libres"]:
+            continue
+        mots_arret = extraire_mots(a["nom"])
+        ok = all(any(m == x or m in x or difflib.SequenceMatcher(None, m, x).ratio() >= 0.75
+                     for x in mots_arret) for m in mots)
+        if ok:
+            trouves.append(a)
+    if not trouves:
+        return None
+    lat = sum(a["latitude"] for a in trouves) / len(trouves)
+    lon = sum(a["longitude"] for a in trouves) / len(trouves)
+    return {"nom": lieu.strip().title(), "latitude": lat, "longitude": lon, "alternatives": []}
 
 def rechercher_lieu(lieu: Optional[str]):
+    """Transforme un nom de lieu en coordonnées. Google Maps d'abord, sinon nos arrêts."""
+    lieu = (lieu or "").strip()
     if not lieu:
         return None
-    lieu_clean = lieu.strip()
-    if not lieu_clean:
-        return None
-    cle = ("geo", lieu_clean.lower())
+    cle = ("geo", lieu.lower())
     deja = cache_get(cle)
     if deja:
         return deja
-
-    queries = [
-        f"{lieu_clean}, Abidjan, Côte d'Ivoire",
-        f"{lieu_clean}, Abidjan",
-        f"{lieu_clean} Abidjan",
-    ]
-
-    for q in queries:
-        try:
-            res = serpapi.search({
-                "api_key": SERPAPI_KEY,
-                "engine": "google_maps",
-                "type": "search",
-                "q": q,
-                "ll": CENTRE_ABIDJAN,
-                "hl": "fr",
-                "gl": "ci",
-            }).as_dict()
-        except Exception as e:
-            log.error("erreur serpapi : %s", e)
-            continue
-
-        candidats = []
-        if res.get("place_results"):
-            candidats.append(res["place_results"])
-        candidats += res.get("local_results", []) or []
-
-        for r in candidats:
-            coords = r.get("gps_coordinates") or {}
-            lat = coords.get("latitude")
-            lon = coords.get("longitude")
-            if lat is None or lon is None:
-                continue
-            titre = (r.get("title") or lieu_clean).strip()
-            # on évite les résultats trop vagues ou hors Abidjan si possible
-            adresse = (r.get("address") or "").lower()
-            if "abidjan" not in adresse and "côte d'ivoire" not in adresse and "cote d'ivoire" not in adresse:
-                # on accepte quand même si c'est le premier résultat pertinent
-                pass
-            resultat = {
-                "nom": titre,
-                "latitude": float(lat),
-                "longitude": float(lon),
-                "alternatives": [],
-            }
-            cache_set(cle, resultat)
-            return resultat
-
-    return None
-
+    resultat = None
+    for requete in (f"{lieu}, Abidjan, Côte d'Ivoire", f"{lieu} Abidjan"):
+        trouves = _google_maps(requete)
+        if trouves:
+            t = trouves[0]
+            resultat = {"nom": t["nom"], "latitude": t["latitude"], "longitude": t["longitude"],
+                        "alternatives": []}
+            break
+    if not resultat:
+        resultat = _lieu_dans_nos_arrets(lieu)      # secours local
+    if resultat:
+        cache_set(cle, resultat)
+    return resultat
 
 def suggestions_lieu(lieu: str, limite: int = 8) -> list:
-    if not lieu or len(lieu.strip()) < 2:
+    """Liste de suggestions pendant que l'utilisateur tape (arrêts locaux, puis Google Maps)."""
+    lieu = (lieu or "").strip()
+    if len(lieu) < 2:
         return []
-
-    lieu = lieu.strip()
     cle = ("suggestions", lieu.lower())
     deja = cache_get(cle)
     if deja is not None:
         return deja
-
-    resultats = []
-    vus = set()
-
     if not RESEAU["charge"]:
         charger_reseau_local()
-
-    texte_nettoye = nettoyer_texte(lieu)
-    for arret in RESEAU["arrets"].values():
-        if arret["id"] in RESEAU["points_libres"]:
+    resultats, vus = [], set()
+    texte = nettoyer_texte(lieu)
+    for a in RESEAU["arrets"].values():
+        if a["id"] in RESEAU["points_libres"] or a["nom"] in vus:
             continue
-        nom_nettoye = nettoyer_texte(arret["nom"])
-        if texte_nettoye in nom_nettoye or any(m in nom_nettoye for m in texte_nettoye.split() if len(m) > 3):
-            if arret["nom"] in vus:
-                continue
-            vus.add(arret["nom"])
-            resultats.append({
-                "nom": arret["nom"],
-                "adresse": "",
-                "latitude": arret["latitude"],
-                "longitude": arret["longitude"],
-            })
+        nom = nettoyer_texte(a["nom"])
+        if texte in nom or any(m in nom for m in texte.split() if len(m) > 3):
+            vus.add(a["nom"])
+            resultats.append({"nom": a["nom"], "adresse": "", "latitude": a["latitude"],
+                              "longitude": a["longitude"]})
             if len(resultats) >= limite:
                 break
-
     if len(resultats) < limite:
-        try:
-            res = serpapi.search({
-                "api_key": SERPAPI_KEY,
-                "engine": "google_maps",
-                "type": "search",
-                "q": f"{lieu}, Abidjan, Côte d'Ivoire",
-                "ll": CENTRE_ABIDJAN,
-                "hl": "fr",
-                "gl": "ci",
-            }).as_dict()
-
-            for r in (res.get("local_results") or []) + ([res["place_results"]] if res.get("place_results") else []):
-                coords = r.get("gps_coordinates") or {}
-                if not (coords.get("latitude") and coords.get("longitude")):
-                    continue
-                nom = r.get("title") or "lieu"
-                if nom in vus:
-                    continue
-                vus.add(nom)
-                resultats.append({
-                    "nom": nom,
-                    "adresse": r.get("address") or "",
-                    "latitude": float(coords["latitude"]),
-                    "longitude": float(coords["longitude"]),
-                })
-                if len(resultats) >= limite:
-                    break
-        except Exception as e:
-            log.warning("suggestions serpapi echouee : %s", e)
-
+        for t in _google_maps(f"{lieu}, Abidjan, Côte d'Ivoire"):
+            if t["nom"] not in vus and len(resultats) < limite:
+                vus.add(t["nom"])
+                resultats.append(t)
     cache_set(cle, resultats)
     return resultats
 
-
-MOTS_POSITION = (
-    "position", "ici", "je suis la", "je suis ici", "pres de moi", "autour de moi",
-    "chez moi", "mon emplacement", "ma localisation", "localisation",
-)
-
+MOTS_POSITION = ("position", "ici", "je suis la", "je suis ici", "pres de moi", "autour de moi",
+                 "chez moi", "mon emplacement", "ma localisation", "localisation")
 
 def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon: Optional[float] = None):
+    """Point de départ : le lieu écrit, sinon la position GPS du téléphone."""
+    texte = nettoyer_texte((dep_texte or "").strip())
     a_gps = lat is not None and lon is not None
-    texte = (dep_texte or "").strip()
-    texte_net = nettoyer_texte(texte)
-
-    if a_gps and (not texte_net or texte_net in ("null", "none", "aucun")
-                  or any(m in texte_net for m in MOTS_POSITION)):
-        return {"nom": "ma position actuelle", "latitude": float(lat), "longitude": float(lon), "alternatives": []}
-
-    if texte_net and texte_net not in ("null", "none", "aucun") and not any(m in texte_net for m in MOTS_POSITION):
-        lieu = rechercher_lieu(texte)
+    ma_position = {"nom": "ma position actuelle", "latitude": lat, "longitude": lon, "alternatives": []}
+    parle_position = (not texte or texte in ("null", "none", "aucun")
+                      or any(m in texte for m in MOTS_POSITION))
+    if a_gps and parle_position:
+        return ma_position
+    if not parle_position:
+        lieu = rechercher_lieu(dep_texte)
         if lieu:
             return lieu
+    return ma_position if a_gps else None
 
-    if a_gps:
-        return {"nom": "ma position actuelle", "latitude": float(lat), "longitude": float(lon), "alternatives": []}
-    return None
-
-
-# donnees 
-
-CATALOGUE = []
+# ── 3. DONNÉES : chargement des fichiers CSV ──
+CATALOGUE = []                 # une entrée par ligne (bus, bateau, gbaka/woro)
 RESEAU = {
-    "arrets": {},
-    "lignes": {},
-    "sequences": {},
+    "arrets": {},              # id -> {id, nom, latitude, longitude}
+    "lignes": {},              # id de ligne -> infos de la ligne
+    "sequences": {},           # id de ligne -> liste ordonnée d'ids d'arrêts
     "lignes_par_arret": defaultdict(list),
-    "gares": set(),
-    "points_libres": set(),
-    "arrets_non_bus": set(),
-    "arrets_bus": set(),
-    "arrets_gbaka": set(),
+    "gares": set(), "points_libres": set(),
+    "arrets_non_bus": set(), "arrets_bus": set(), "arrets_gbaka": set(),
     "charge": False,
 }
 _lock = threading.Lock()
 
-
 def _trace_estimee(row) -> bool:
     origine = nettoyer_texte(row.get("origine_trace") or "")
-    complet = nettoyer_texte(row.get("trace_complete") or "")
-    return "approximatif" in origine or "introuvable" in origine or complet == "non"
+    return ("approximatif" in origine or "introuvable" in origine
+            or nettoyer_texte(row.get("trace_complete") or "") == "non")
 
+def _lire_csv(nom_fichier: str):
+    """Lit un CSV (séparateur « ; ») et rend la liste des lignes (dictionnaires)."""
+    chemin = os.path.join(DATA_DIR, nom_fichier)
+    if not os.path.exists(chemin):
+        return []
+    with open(chemin, encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f, delimiter=";"))
+
+def _entier(valeur, defaut: int) -> int:
+    try:
+        return int(float(valeur or defaut))
+    except Exception:
+        return defaut
 
 def charger_catalogue():
+    """Remplit CATALOGUE avec les bus, les bateaux-bus et les gbakas/woro-woro."""
     global CATALOGUE
     CATALOGUE = []
-
-    chemin = os.path.join(DATA_DIR, "bus.csv")
-    if os.path.exists(chemin):
-        with open(chemin, encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f, delimiter=";")
-            for row in reader:
-                numero = (row.get("numero_ligne") or "").strip()
-                origine = (row.get("depart") or "").strip()
-                destination = (row.get("arrivee") or "").strip()
-                if not origine or not destination:
-                    continue
-                try:
-                    prix = int(float(row.get("prix_fcfa") or 200))
-                except Exception:
-                    prix = 200
-                trace, bbox = _charger_trace(row.get("trace_wkt") or "")
-                CATALOGUE.append({
-                    "numero": numero,
-                    "origine": origine,
-                    "destination": destination,
-                    "operateur": (row.get("operateur") or "SOTRA").strip(),
-                    "reseau": (row.get("reseau") or "Monbus").strip(),
-                    "type": "BUS",
-                    "prix_fcfa": prix,
-                    "trace": trace,
-                    "bbox": bbox,
-                    "estime": _trace_estimee(row),
-                })
-
-    chemin = os.path.join(DATA_DIR, "bateau_bus.csv")
-    if os.path.exists(chemin):
-        with open(chemin, encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f, delimiter=";")
-            for row in reader:
-                numero = (row.get("numero_ligne") or "").strip()
-                origine = (row.get("depart") or "").strip()
-                destination = (row.get("arrivee") or "").strip()
-                if not origine or not destination:
-                    continue
-                try:
-                    prix = int(float(row.get("prix_minimum_fcfa") or 150))
-                except Exception:
-                    prix = 150
-                trace, bbox = _charger_trace(row.get("trace_wkt") or "")
-                CATALOGUE.append({
-                    "numero": numero,
-                    "origine": origine,
-                    "destination": destination,
-                    "operateur": (row.get("operateur") or "SOTRA").strip(),
-                    "reseau": (row.get("reseau") or "Monbato").strip(),
-                    "type": "BATEAU",
-                    "prix_fcfa": prix,
-                    "trace": trace,
-                    "bbox": bbox,
-                    "estime": _trace_estimee(row),
-                })
-
-    chemin = os.path.join(DATA_DIR, "gbaka_woro.csv")
-    if os.path.exists(chemin):
-        entrees = {}
-        with open(chemin, encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f, delimiter=";")
-            for row in reader:
-                type_raw = (row.get("type_transport") or "").strip().lower()
-                origine = (row.get("depart") or "").strip()
-                destination = (row.get("arrivee") or "").strip()
-                if not origine or not destination:
-                    continue
-                type_ligne = "WORO_WORO" if "woro" in type_raw else "GBAKA"
-
-                sa = {
-                    "destination": (row.get("sens_aller_destination") or "").strip(),
-                    "liste_arrets": _parse_liste_arrets(row.get("sens_aller_liste_arrets") or ""),
-                    "coordonnees": _parse_coords_str(row.get("sens_aller_coordonnees_gps") or ""),
-                }
-                sr = {
-                    "destination": (row.get("sens_retour_destination") or "").strip(),
-                    "liste_arrets": _parse_liste_arrets(row.get("sens_retour_liste_arrets") or ""),
-                    "coordonnees": _parse_coords_str(row.get("sens_retour_coordonnees_gps") or ""),
-                }
-
-                if not sa["liste_arrets"] and not sr["liste_arrets"]:
-                    continue
-
-                id_osm = (row.get("id_osm") or "").strip()
-                origine_trace = (row.get("origine_trace") or "").strip()
-                cle = id_osm or (type_ligne, origine, destination)
-
-                nb_stops = len(sa["liste_arrets"]) + len(sr["liste_arrets"])
-                if cle in entrees and nb_stops <= entrees[cle]["_nb_stops"]:
-                    continue
-
-                trace, bbox = _charger_trace(row.get("trace_wkt") or "")
-                entrees[cle] = {
-                    "numero": None,
-                    "origine": origine,
-                    "destination": destination,
-                    "operateur": (row.get("operateur") or "divers").strip(),
-                    "reseau": (row.get("reseau_commune") or "Autre").strip(),
-                    "type": type_ligne,
-                    "prix_fcfa": 200,
-                    "trace": trace,
-                    "bbox": bbox,
-                    "estime": _trace_estimee(row),
-                    "id_osm": id_osm,
-                    "origine_trace": origine_trace,
-                    "sens_aller": sa,
-                    "sens_retour": sr,
-                    "_nb_stops": nb_stops,
-                }
-        for e in entrees.values():
-            e.pop("_nb_stops", None)
-            CATALOGUE.append(e)
-
+    # Bus et bateau-bus : même structure, seul le fichier et la colonne du prix changent.
+    for fichier, type_ligne, col_prix, prix_def, reseau_def in (
+            ("bus.csv", "BUS", "prix_fcfa", 200, "Monbus"),
+            ("bateau_bus.csv", "BATEAU", "prix_minimum_fcfa", 150, "Monbato")):
+        for row in _lire_csv(fichier):
+            origine, destination = (row.get("depart") or "").strip(), (row.get("arrivee") or "").strip()
+            if not origine or not destination:
+                continue
+            trace, bbox = _charger_trace(row.get("trace_wkt") or "")
+            CATALOGUE.append({
+                "numero": (row.get("numero_ligne") or "").strip(), "origine": origine,
+                "destination": destination, "operateur": (row.get("operateur") or "SOTRA").strip(),
+                "reseau": (row.get("reseau") or reseau_def).strip(), "type": type_ligne,
+                "prix_fcfa": _entier(row.get(col_prix), prix_def), "trace": trace, "bbox": bbox,
+                "estime": _trace_estimee(row)})
+    # Gbaka / woro-woro : une ligne a deux sens (aller et retour) avec leurs arrêts.
+    entrees = {}
+    for row in _lire_csv("gbaka_woro.csv"):
+        origine, destination = (row.get("depart") or "").strip(), (row.get("arrivee") or "").strip()
+        if not origine or not destination:
+            continue
+        type_ligne = "WORO_WORO" if "woro" in (row.get("type_transport") or "").lower() else "GBAKA"
+        sens = {}
+        for nom_sens, pref in (("sens_aller", "sens_aller"), ("sens_retour", "sens_retour")):
+            sens[nom_sens] = {
+                "destination": (row.get(pref + "_destination") or "").strip(),
+                "liste_arrets": _liste_arrets(row.get(pref + "_liste_arrets") or ""),
+                "coordonnees": _liste_coords(row.get(pref + "_coordonnees_gps") or "")}
+        nb_stops = len(sens["sens_aller"]["liste_arrets"]) + len(sens["sens_retour"]["liste_arrets"])
+        if nb_stops == 0:
+            continue
+        id_osm = (row.get("id_osm") or "").strip()
+        cle = id_osm or (type_ligne, origine, destination)
+        if cle in entrees and nb_stops <= entrees[cle]["_nb_stops"]:
+            continue                                   # doublon : on garde le plus complet
+        trace, bbox = _charger_trace(row.get("trace_wkt") or "")
+        entrees[cle] = {
+            "numero": None, "origine": origine, "destination": destination,
+            "operateur": (row.get("operateur") or "divers").strip(),
+            "reseau": (row.get("reseau_commune") or "Autre").strip(), "type": type_ligne,
+            "prix_fcfa": 200, "trace": trace, "bbox": bbox, "estime": _trace_estimee(row),
+            "id_osm": id_osm, "origine_trace": (row.get("origine_trace") or "").strip(),
+            "sens_aller": sens["sens_aller"], "sens_retour": sens["sens_retour"],
+            "_nb_stops": nb_stops}
+    for e in entrees.values():
+        e.pop("_nb_stops")
+        CATALOGUE.append(e)
     log.info("catalogue charge : %d lignes", len(CATALOGUE))
 
-
-# sequences d arrets 
-
+# ── Petits calculs sur la carte ──────────────────────────────────────────────
 def _dist_rapide(lat1, lon1, lat2, lon2) -> float:
+    """Distance approximative en mètres (rapide, assez juste à Abidjan)."""
     dy = (lat1 - lat2) * 111320.0
     dx = (lon1 - lon2) * 111320.0 * 0.9956
     return (dx * dx + dy * dy) ** 0.5
 
-
 def _cellule(lat, lon, taille):
+    """Case de la grille où se trouve un point (sert à chercher vite les voisins)."""
     return (int(lat / taille), int(lon / taille))
 
-
-def _grille_arrets(taille):
+def _grille_arrets(taille, ids=None):
+    """Range les arrêts dans une grille : on ne compare qu'avec les cases voisines."""
     grille = defaultdict(list)
-    for sid, a in RESEAU["arrets"].items():
-        if sid in RESEAU["points_libres"]:
-            continue
-        grille[_cellule(a["latitude"], a["longitude"], taille)].append(sid)
+    for sid in (ids if ids is not None else RESEAU["arrets"]):
+        a = RESEAU["arrets"][sid]
+        if sid not in RESEAU["points_libres"]:
+            grille[_cellule(a["latitude"], a["longitude"], taille)].append(sid)
     return grille
 
+def _voisins(grille, lat, lon, taille):
+    """Tous les arrêts des 9 cases autour d'un point."""
+    ci, cj = _cellule(lat, lon, taille)
+    return [sid for di in (-1, 0, 1) for dj in (-1, 0, 1) for sid in grille.get((ci + di, cj + dj), ())]
 
+def _point_proche_du_trace(lat, lon, trace, bbox, seuil_m=300) -> bool:
+    """Vrai si le point est à moins de seuil_m du tracé d'une ligne."""
+    if not trace or not bbox:
+        return False
+    marge = seuil_m / 100000.0 + 0.001
+    if not (bbox[0] - marge <= lat <= bbox[2] + marge and bbox[1] - marge <= lon <= bbox[3] + marge):
+        return False
+    return any(distance_m(lat, lon, tl, tn) <= seuil_m for tl, tn in trace)
+
+# ── Séquences d'arrêts : dans quel ordre une ligne passe par ses arrêts ─────
 def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
-    passages = defaultdict(list)
+    """Liste ordonnée des arrêts situés à moins de seuil_m du tracé (sans doublons proches)."""
+    passages = defaultdict(list)                       # arrêt -> [(position sur le tracé, distance)]
     for idx, (lat, lon) in enumerate(trace):
-        ci, cj = _cellule(lat, lon, taille)
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
-                for sid in grille.get((ci + di, cj + dj), ()):
-                    a = RESEAU["arrets"][sid]
-                    d = _dist_rapide(lat, lon, a["latitude"], a["longitude"])
-                    if d > seuil_m:
-                        continue
-                    if filtre and not filtre(sid, a["nom"]):
-                        continue
-                    passages[sid].append((idx, d))
-
-    evenements = []
+        for sid in _voisins(grille, lat, lon, taille):
+            a = RESEAU["arrets"][sid]
+            d = _dist_rapide(lat, lon, a["latitude"], a["longitude"])
+            if d <= seuil_m and (not filtre or filtre(sid, a["nom"])):
+                passages[sid].append((idx, d))
+    evenements = []                                    # (position, arrêt) : 1 passage par arrêt
     for sid, hits in passages.items():
         groupe = [hits[0]]
-        for h in hits[1:]:
-            if h[0] - groupe[-1][0] <= 6:
+        for h in hits[1:] + [None]:
+            if h is not None and h[0] - groupe[-1][0] <= 6:
                 groupe.append(h)
-            else:
-                evenements.append((min(groupe, key=lambda x: x[1])[0], sid))
-                groupe = [h]
-        evenements.append((min(groupe, key=lambda x: x[1])[0], sid))
+                continue
+            evenements.append((min(groupe, key=lambda x: x[1])[0], sid))
+            groupe = [h] if h else []
     evenements.sort()
-
     gardes = []
-    for idx, sid in evenements:
+    for _, sid in evenements:                          # on enlève les arrêts de même nom très proches
         a = RESEAU["arrets"][sid]
         nom = nettoyer_texte(a["nom"])
-        doublon = False
-        for autre in gardes[-6:]:
-            b = RESEAU["arrets"][autre]
-            if nettoyer_texte(b["nom"]) == nom and _dist_rapide(
-                    a["latitude"], a["longitude"], b["latitude"], b["longitude"]) < 250:
-                doublon = True
-                break
-        if not doublon:
+        if not any(nettoyer_texte(RESEAU["arrets"][b]["nom"]) == nom and _dist_rapide(
+                a["latitude"], a["longitude"], RESEAU["arrets"][b]["latitude"],
+                RESEAU["arrets"][b]["longitude"]) < 250 for b in gardes[-6:]):
             gardes.append(sid)
     return gardes
 
-
-def _points_de_chargement(trace, pas_m=300):
-    if not trace:
-        return []
-    points = [trace[0]]
-    cumul = 0.0
-    for p, q in zip(trace, trace[1:]):
-        cumul += _dist_rapide(p[0], p[1], q[0], q[1])
-        if cumul >= pas_m:
-            points.append(q)
-            cumul = 0.0
-    if points[-1] != trace[-1]:
-        points.append(trace[-1])
-    return points
-
-
 def _est_arret_de_bus(sid: str, nom: str) -> bool:
-    if "lagunaire" in nettoyer_texte(nom):
-        return False
-    if RESEAU["arrets_bus"]:
-        return sid in RESEAU["arrets_bus"]
-    return False
-
+    return "lagunaire" not in nettoyer_texte(nom) and sid in RESEAU["arrets_bus"]
 
 def _nom_point(lat, lon, grille_noms) -> str:
+    """Nom d'un point « bord de route » : on cite l'arrêt connu le plus proche."""
     proche, dmin = None, 400
-    ci, cj = _cellule(lat, lon, 0.004)
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            for sid in grille_noms.get((ci + di, cj + dj), ()):
-                a = RESEAU["arrets"][sid]
-                d = _dist_rapide(lat, lon, a["latitude"], a["longitude"])
-                if d < dmin and len(a["nom"].strip()) >= 4 and not a["nom"].strip().isdigit():
-                    proche, dmin = a["nom"], d
+    for sid in _voisins(grille_noms, lat, lon, 0.004):
+        a = RESEAU["arrets"][sid]
+        d = _dist_rapide(lat, lon, a["latitude"], a["longitude"])
+        if d < dmin and len(a["nom"].strip()) >= 4 and not a["nom"].strip().isdigit():
+            proche, dmin = a["nom"], d
     return f"Bord de route près de {proche}" if proche else "Bord de route"
 
-
 def _boucle_asymetrique(trace) -> bool:
-    if len(trace) < 20 or _dist_rapide(trace[0][0], trace[0][1], trace[-1][0], trace[-1][1]) > 500:
+    """Vrai si la ligne fait une boucle (le retour ne repasse pas par l'aller)."""
+    if len(trace) < 20 or _dist_rapide(*trace[0], *trace[-1]) > 500:
         return False
-    loin = max(range(len(trace)), key=lambda j: _dist_rapide(trace[0][0], trace[0][1], trace[j][0], trace[j][1]))
-    aller, retour = trace[:loin + 1], trace[loin:]
+    loin = max(range(len(trace)), key=lambda j: _dist_rapide(*trace[0], *trace[j]))
+    retour = trace[loin:]
     grille = defaultdict(list)
-    for p in aller:
+    for p in trace[:loin + 1]:
         grille[_cellule(p[0], p[1], 0.002)].append(p)
     pareil = 0
     for p in retour:
         ci, cj = _cellule(p[0], p[1], 0.002)
-        if any(_dist_rapide(p[0], p[1], q[0], q[1]) < 200 for di in (-1, 0, 1) for dj in (-1, 0, 1)
+        if any(_dist_rapide(*p, *q) < 200 for di in (-1, 0, 1) for dj in (-1, 0, 1)
                for q in grille.get((ci + di, cj + dj), ())):
             pareil += 1
     return pareil < 0.6 * len(retour)
 
-
 def _sequence_gbaka(i, trace, grille_gbaka, grille_noms):
+    """Gbaka sans liste d'arrêts : vrais arrêts le long du tracé + un point tous les 300 m."""
     reels = _arrets_le_long_du_trace(trace, grille_gbaka, 0.0006, 40)
     evenements = []
     for sid in reels:
         a = RESEAU["arrets"][sid]
-        k = min(range(len(trace)), key=lambda j: _dist_rapide(a["latitude"], a["longitude"], trace[j][0], trace[j][1]))
+        k = min(range(len(trace)), key=lambda j: _dist_rapide(a["latitude"], a["longitude"], *trace[j]))
         evenements.append((k, sid))
-    cumul, dernier = 0.0, 0
+    cumul = 0.0
     for k, (lat, lon) in enumerate(trace):
         if k:
-            cumul += _dist_rapide(trace[k - 1][0], trace[k - 1][1], lat, lon)
+            cumul += _dist_rapide(*trace[k - 1], lat, lon)
         if k and cumul < 300 and k != len(trace) - 1:
             continue
         cumul = 0.0
-        if any(_dist_rapide(lat, lon, RESEAU["arrets"][sid]["latitude"], RESEAU["arrets"][sid]["longitude"]) < 150
-               for sid in reels):
+        if any(_dist_rapide(lat, lon, RESEAU["arrets"][s]["latitude"], RESEAU["arrets"][s]["longitude"]) < 150
+               for s in reels):
             continue
         pid = f"g:{i}:{k}"
-        RESEAU["arrets"][pid] = {"id": pid, "nom": _nom_point(lat, lon, grille_noms), "latitude": lat, "longitude": lon}
+        RESEAU["arrets"][pid] = {"id": pid, "nom": _nom_point(lat, lon, grille_noms),
+                                 "latitude": lat, "longitude": lon}
         RESEAU["points_libres"].add(pid)
         evenements.append((k, pid))
     return [sid for _, sid in sorted(evenements, key=lambda x: x[0])]
 
-
-def _index_stops_par_nom() -> dict:
-    idx = defaultdict(list)
-    for sid, a in RESEAU["arrets"].items():
-        idx[nettoyer_texte(a["nom"])].append(sid)
-    return idx
-
-
-def _trouver_stop_existant(nom: str, lat, lon, index: dict) -> Optional[str]:
-    nom_clean = nettoyer_texte(nom)
-    candidats = index.get(nom_clean, [])
-    if not candidats:
-        return None
-    if lat is None or lon is None:
-        return candidats[0]
-    best, dmin = None, 120.0
-    for sid in candidats:
-        a = RESEAU["arrets"][sid]
-        d = _dist_rapide(lat, lon, a["latitude"], a["longitude"])
-        if d < dmin:
-            dmin = d
-            best = sid
-    return best
-
-
-def _resoudre_stops_csv(sens: dict, i: int, sens_label: str, index: dict) -> list:
-    noms = sens.get("liste_arrets") or []
+def _resoudre_stops_csv(sens: dict, i: int, label: str, index: dict) -> list:
+    """Transforme les noms d'arrêts d'un sens gbaka en ids d'arrêts (existants ou créés)."""
     coords = sens.get("coordonnees") or []
-    if not noms:
-        return []
     ids = []
-    for idx, nom in enumerate(noms):
-        nom_clean = (nom or "").strip()
-        if not nom_clean:
+    for idx, nom in enumerate(sens.get("liste_arrets") or []):
+        nom = (nom or "").strip()
+        if not nom:
             continue
-        lat, lon = None, None
-        if idx < len(coords):
-            lon, lat = coords[idx]
-        stop_id = _trouver_stop_existant(nom_clean, lat, lon, index)
-        if stop_id:
-            ids.append(stop_id)
-            continue
-        if lat is None or lon is None:
-            continue
-        nouveau = f"csv:{i}:{sens_label}:{idx}"
-        RESEAU["arrets"][nouveau] = {
-            "id": nouveau,
-            "nom": nom_clean,
-            "latitude": float(lat),
-            "longitude": float(lon),
-        }
-        index.setdefault(nettoyer_texte(nom_clean), []).append(nouveau)
-        ids.append(nouveau)
+        lon, lat = coords[idx] if idx < len(coords) else (None, None)
+        existants = index.get(nettoyer_texte(nom), [])
+        choisi = None
+        if existants and lat is None:
+            choisi = existants[0]
+        elif existants:                                # le même nom à moins de 120 m
+            d, choisi = min((_dist_rapide(lat, lon, RESEAU["arrets"][s]["latitude"],
+                                          RESEAU["arrets"][s]["longitude"]), s) for s in existants)
+            choisi = choisi if d < 120 else None
+        if not choisi and lat is not None:
+            choisi = f"csv:{i}:{label}:{idx}"
+            RESEAU["arrets"][choisi] = {"id": choisi, "nom": nom, "latitude": float(lat), "longitude": float(lon)}
+            index.setdefault(nettoyer_texte(nom), []).append(choisi)
+        if choisi:
+            ids.append(choisi)
     return ids
 
-
 def _arrets_ligne_pour_api(rid: str) -> list:
-    if not isinstance(rid, str) or not rid.startswith("cat:"):
+    """Pour l'écran « détail d'une ligne » : les arrêts de chaque sens d'un gbaka/woro."""
+    if not isinstance(rid, str) or not rid.startswith("cat:") or not rid[4:].isdigit():
         return []
-    try:
-        i = int(rid[4:])
-    except ValueError:
+    i = int(rid[4:])
+    if i >= len(CATALOGUE) or CATALOGUE[i]["type"] not in ("GBAKA", "WORO_WORO"):
         return []
-    if i < 0 or i >= len(CATALOGUE):
-        return []
-    c = CATALOGUE[i]
-    if c["type"] not in ("GBAKA", "WORO_WORO"):
-        return []
-
-    sens_list = []
-    for label, sens_data in (("aller",  c.get("sens_aller")  or {}),
-                             ("retour", c.get("sens_retour") or {})):
-        noms = sens_data.get("liste_arrets") or []
-        coords = sens_data.get("coordonnees") or []
+    c, sens_list = CATALOGUE[i], []
+    for label in ("aller", "retour"):
+        data = c.get("sens_" + label) or {}
+        noms, coords = data.get("liste_arrets") or [], data.get("coordonnees") or []
         if len(noms) < 2:
             continue
-
         arrets = []
         for idx, nom in enumerate(noms):
-            lat = lon = None
-            if idx < len(coords):
-                lon, lat = coords[idx]
-            arrets.append({
-                "id": f"csv:{i}:{label}:{idx}",
-                "nom": (nom or "").strip(),
-                "latitude": lat,
-                "longitude": lon,
-            })
-        if len(arrets) < 2:
-            continue
-
-        sens_list.append({
-            "sens": label,
-            "depart": arrets[0]["nom"],
-            "arrivee": arrets[-1]["nom"],
-            "nb_arrets": len(arrets),
-            "arrets": arrets,
-        })
+            lon, lat = coords[idx] if idx < len(coords) else (None, None)
+            arrets.append({"id": f"csv:{i}:{label}:{idx}", "nom": (nom or "").strip(),
+                           "latitude": lat, "longitude": lon})
+        sens_list.append({"sens": label, "depart": arrets[0]["nom"], "arrivee": arrets[-1]["nom"],
+                          "nb_arrets": len(arrets), "arrets": arrets})
     return sens_list
 
+def _enregistrer_sequences(rid: str, sequences: list):
+    """Mémorise les séquences d'une ligne et l'ajoute à chacun de ses arrêts."""
+    RESEAU["sequences"][rid] = sequences
+    for seq in sequences:
+        for sid in seq:
+            if rid not in RESEAU["lignes_par_arret"][sid]:
+                RESEAU["lignes_par_arret"][sid].append(rid)
 
 def _construire_sequences_depuis_traces():
+    """Pour les lignes du catalogue (CSV) : trouve les arrêts le long de chaque tracé."""
     taille = 0.0006
-    grille = _grille_arrets(taille)
-    grille_noms = _grille_arrets(0.004)
-    grille_gbaka = defaultdict(list)
-    for sid in RESEAU["arrets_gbaka"]:
-        a = RESEAU["arrets"][sid]
-        grille_gbaka[_cellule(a["latitude"], a["longitude"], taille)].append(sid)
-
-    index_noms = _index_stops_par_nom()
+    grille, grille_noms = _grille_arrets(taille), _grille_arrets(0.004)
+    grille_gbaka = _grille_arrets(taille, RESEAU["arrets_gbaka"])
+    index_noms = defaultdict(list)
+    for sid, a in RESEAU["arrets"].items():
+        index_noms[nettoyer_texte(a["nom"])].append(sid)
     nb = 0
-
     for i, c in enumerate(CATALOGUE):
-        rid = f"cat:{i}"
+        rid, trace, type_ligne = f"cat:{i}", c.get("trace") or [], c["type"]
         if rid in RESEAU["sequences"]:
             continue
-        type_ligne = c["type"]
-        trace = c.get("trace") or []
-
         if type_ligne in ("GBAKA", "WORO_WORO"):
-            sa = c.get("sens_aller") or {}
-            sr = c.get("sens_retour") or {}
-            seq_aller = _resoudre_stops_csv(sa, i, "aller", index_noms)
-            seq_retour = _resoudre_stops_csv(sr, i, "retour", index_noms)
-
-            sequences = []
-            if len(seq_aller) >= 2:
-                sequences.append(seq_aller)
-            if len(seq_retour) >= 2 and (not sequences or seq_retour != sequences[0]):
-                sequences.append(seq_retour)
-
-            if sequences:
-                RESEAU["sequences"][rid] = sequences
-                for seq in sequences:
-                    for sid in seq:
-                        if rid not in RESEAU["lignes_par_arret"][sid]:
-                            RESEAU["lignes_par_arret"][sid].append(rid)
+            # 1) on utilise d'abord les listes d'arrêts écrites dans le CSV
+            seqs = []
+            for label in ("aller", "retour"):
+                s = _resoudre_stops_csv(c.get("sens_" + label) or {}, i, label, index_noms)
+                if len(s) >= 2 and (not seqs or s != seqs[0]):
+                    seqs.append(s)
+            if not seqs and len(trace) >= 2 and not c.get("estime"):
+                # 2) sinon on déduit les arrêts du tracé
+                s = _sequence_gbaka(i, trace, grille_gbaka, grille_noms)
+                if len(s) >= 2:
+                    seqs = [s] if _boucle_asymetrique(trace) else [s, s[::-1]]
+            if seqs:
+                _enregistrer_sequences(rid, seqs)
                 nb += 1
-                continue
-
-            if len(trace) < 2 or c.get("estime"):
-                continue
-            sequence = _sequence_gbaka(i, trace, grille_gbaka, grille_noms)
-            if len(sequence) < 2:
-                continue
-            boucle = _boucle_asymetrique(trace)
-            RESEAU["sequences"][rid] = [sequence] if boucle else [sequence, sequence[::-1]]
-            for sid in sequence:
-                if rid not in RESEAU["lignes_par_arret"][sid]:
-                    RESEAU["lignes_par_arret"][sid].append(rid)
-            nb += 1
             continue
-
         if len(trace) < 2 or c.get("estime"):
             continue
         if type_ligne == "BUS":
-            sequence = _arrets_le_long_du_trace(trace, grille, taille, 40, filtre=_est_arret_de_bus)
-        elif type_ligne == "BATEAU":
-            sequence = _arrets_le_long_du_trace(trace, grille, taille * 6, 400,
-                                                filtre=lambda sid, n: "lagunaire" in nettoyer_texte(n))
-        else:
-            continue
-        if len(sequence) < 2:
-            continue
-        RESEAU["sequences"][rid] = [sequence, sequence[::-1]]
-        for sid in sequence:
-            if rid not in RESEAU["lignes_par_arret"][sid]:
-                RESEAU["lignes_par_arret"][sid].append(rid)
-        nb += 1
-
+            s = _arrets_le_long_du_trace(trace, grille, taille, 40, filtre=_est_arret_de_bus)
+        else:                                          # BATEAU : arrêts « lagunaire »
+            s = _arrets_le_long_du_trace(trace, grille, taille * 6, 400,
+                                         filtre=lambda sid, n: "lagunaire" in nettoyer_texte(n))
+        if len(s) >= 2:
+            _enregistrer_sequences(rid, [s, s[::-1]])
+            nb += 1
     log.info("sequences construites depuis les traces : %d lignes", nb)
 
+def _lire_arrets_gtfs(nom_fichier: str):
+    """Ajoute à RESEAU les arrêts d'un fichier (arret.csv, stops.txt...)."""
+    chemin = os.path.join(DATA_DIR, nom_fichier)
+    if not os.path.exists(chemin):
+        return False
+    with open(chemin, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            try:
+                sid = row["stop_id"].strip()
+                if sid in RESEAU["arrets"]:
+                    continue
+                nom = (row.get("stop_name") or "").strip()
+                RESEAU["arrets"][sid] = {"id": sid, "nom": nom, "latitude": float(row["stop_lat"]),
+                                         "longitude": float(row["stop_lon"])}
+                if est_gare(nom):
+                    RESEAU["gares"].add(sid)
+            except Exception:
+                continue
+    return True
+
+def _type_ligne_gtfs(agence: str, nom: str) -> str:
+    texte = f"{agence} {nom}".lower()
+    if "gbaka" in texte:
+        return "GBAKA"
+    if "woro" in texte:
+        return "WORO_WORO"
+    if any(x in texte for x in ("bateau", "stl", "aqua", "monbato")):
+        return "BATEAU"
+    return "BUS"
 
 def charger_reseau_local():
+    """Charge TOUT le réseau en mémoire (appelé une seule fois, au démarrage)."""
     with _lock:
         if RESEAU["charge"]:
             return
-
         log.info("chargement du reseau local...")
         charger_catalogue()
-
-        chemin = os.path.join(DATA_DIR, "arret.csv")
-        if os.path.exists(chemin):
-            with open(chemin, encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    try:
-                        sid = row["stop_id"].strip()
-                        nom = (row.get("stop_name") or "").strip()
-                        lat = float(row["stop_lat"])
-                        lon = float(row["stop_lon"])
-                        RESEAU["arrets"][sid] = {"id": sid, "nom": nom,
-                                                 "latitude": lat, "longitude": lon}
-                        if est_gare(nom):
-                            RESEAU["gares"].add(sid)
-                    except Exception:
-                        continue
-        else:
+        if not _lire_arrets_gtfs("arret.csv"):
             log.warning("arret.csv introuvable")
-
         for nom_fichier in ("stops.txt", "stops-2.txt"):
+            if _lire_arrets_gtfs(nom_fichier):
+                log.info("arrets ajoutes depuis %s", nom_fichier)
+
+        def lire(nom_fichier):
             chemin = os.path.join(DATA_DIR, nom_fichier)
             if not os.path.exists(chemin):
-                continue
-            with open(chemin, encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    try:
-                        sid = row["stop_id"].strip()
-                        if sid in RESEAU["arrets"]:
-                            continue
-                        nom = (row.get("stop_name") or "").strip()
-                        lat = float(row["stop_lat"])
-                        lon = float(row["stop_lon"])
-                        RESEAU["arrets"][sid] = {"id": sid, "nom": nom,
-                                                 "latitude": lat, "longitude": lon}
-                        if est_gare(nom):
-                            RESEAU["gares"].add(sid)
-                    except Exception:
-                        continue
-            log.info("arrets ajoutes depuis %s", nom_fichier)
-
-        chemin = os.path.join(DATA_DIR, "routes.txt")
-        if os.path.exists(chemin):
+                return []
             with open(chemin, encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    rid = row.get("route_id")
-                    if not rid:
-                        continue
-                    numero = (row.get("route_short_name") or "").strip()
-                    nom = (row.get("route_long_name") or "").strip()
-                    agency = (row.get("agency_id") or "").lower()
-
-                    if "gbaka" in agency or "gbaka" in nom.lower():
-                        type_ligne = "GBAKA"
-                    elif "woro" in agency or "woro" in nom.lower():
-                        type_ligne = "WORO_WORO"
-                    elif any(x in agency or x in nom.lower() for x in ("bateau", "stl", "aqua", "monbato")):
-                        type_ligne = "BATEAU"
-                    else:
-                        type_ligne = "BUS"
-
-                    RESEAU["lignes"][rid] = {
-                        "id": rid, "numero": numero or None, "nom": nom,
-                        "type": type_ligne, "operateur": row.get("agency_id") or "inconnu",
-                    }
-
-        trips = defaultdict(list)
-        chemin = os.path.join(DATA_DIR, "trips.txt")
-        if os.path.exists(chemin):
-            with open(chemin, encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    trips[row["route_id"]].append(row["trip_id"])
-
-        stop_times = defaultdict(list)
-        chemin = os.path.join(DATA_DIR, "stop_times.txt")
-        if os.path.exists(chemin):
-            with open(chemin, encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    try:
-                        stop_times[row["trip_id"]].append({
-                            "stop_id": row["stop_id"], "seq": int(row["stop_sequence"]),
-                        })
-                    except Exception:
-                        continue
-
-        for rid, trip_ids in trips.items():
-            if not trip_ids:
-                continue
-            toutes_les_sequences = []
-            arrets_de_la_ligne = set()
-            for tid in trip_ids:
-                arrets_ordonnes = sorted(stop_times.get(tid, []), key=lambda x: x["seq"])
-                sequence = [a["stop_id"] for a in arrets_ordonnes if a["stop_id"] in RESEAU["arrets"]]
-                if len(sequence) >= 2:
-                    if sequence not in toutes_les_sequences:
-                        toutes_les_sequences.append(sequence)
-                    arrets_de_la_ligne.update(sequence)
-            if toutes_les_sequences:
-                for seq in list(toutes_les_sequences):
-                    if seq[::-1] not in toutes_les_sequences:
-                        toutes_les_sequences.append(seq[::-1])
-                RESEAU["sequences"][rid] = toutes_les_sequences
-                for sid in arrets_de_la_ligne:
-                    if rid not in RESEAU["lignes_par_arret"][sid]:
-                        RESEAU["lignes_par_arret"][sid].append(rid)
-
-        arrets_bus, arrets_autres = set(), set()
-        for rid_gtfs, sequences_gtfs in RESEAU["sequences"].items():
-            type_gtfs = RESEAU["lignes"].get(rid_gtfs, {}).get("type")
-            cible = arrets_bus if type_gtfs == "BUS" else arrets_autres
-            for seq in sequences_gtfs:
-                cible.update(seq)
-        RESEAU["arrets_non_bus"] = arrets_autres - arrets_bus
-        RESEAU["arrets_bus"] = arrets_bus
-
-        for rid_gtfs, sequences_gtfs in RESEAU["sequences"].items():
-            if RESEAU["lignes"].get(rid_gtfs, {}).get("type") in ("GBAKA", "WORO_WORO"):
-                for seq in sequences_gtfs:
-                    RESEAU["arrets_gbaka"].update(seq)
-
-        for i, c in enumerate(CATALOGUE):
-            rid = f"cat:{i}"
-            if rid not in RESEAU["lignes"]:
+                return list(csv.DictReader(f))
+        for row in lire("routes.txt"):                 # les lignes GTFS
+            rid = row.get("route_id")
+            if rid:
+                numero, nom = (row.get("route_short_name") or "").strip(), (row.get("route_long_name") or "").strip()
                 RESEAU["lignes"][rid] = {
-                    "id": rid, "numero": c.get("numero"),
-                    "nom": f"{c['origine']} ↔ {c['destination']}",
-                    "type": c["type"], "operateur": c.get("operateur", ""),
-                }
-
+                    "id": rid, "numero": numero or None, "nom": nom,
+                    "type": _type_ligne_gtfs((row.get("agency_id") or ""), nom),
+                    "operateur": row.get("agency_id") or "inconnu"}
+        trips = defaultdict(list)                      # ligne -> ses voyages
+        for row in lire("trips.txt"):
+            trips[row["route_id"]].append(row["trip_id"])
+        passages = defaultdict(list)                   # voyage -> arrêts avec leur rang
+        for row in lire("stop_times.txt"):
+            try:
+                passages[row["trip_id"]].append((int(row["stop_sequence"]), row["stop_id"]))
+            except Exception:
+                continue
+        for rid, trip_ids in trips.items():
+            seqs = []
+            for tid in trip_ids:
+                s = [sid for _, sid in sorted(passages.get(tid, [])) if sid in RESEAU["arrets"]]
+                if len(s) >= 2 and s not in seqs:
+                    seqs.append(s)
+            if seqs:                                   # on ajoute aussi le sens inverse
+                seqs += [s[::-1] for s in list(seqs) if s[::-1] not in seqs]
+                _enregistrer_sequences(rid, seqs)
+        # Quels arrêts servent aux bus ? aux gbakas ? (sert à filtrer les tracés)
+        bus, autres = set(), set()
+        for rid, seqs in RESEAU["sequences"].items():
+            type_l = RESEAU["lignes"].get(rid, {}).get("type")
+            (bus if type_l == "BUS" else autres).update(s for seq in seqs for s in seq)
+            if type_l in ("GBAKA", "WORO_WORO"):
+                RESEAU["arrets_gbaka"].update(s for seq in seqs for s in seq)
+        RESEAU["arrets_bus"], RESEAU["arrets_non_bus"] = bus, autres - bus
+        for i, c in enumerate(CATALOGUE):              # les lignes du catalogue CSV
+            rid = f"cat:{i}"
+            RESEAU["lignes"].setdefault(rid, {
+                "id": rid, "numero": c.get("numero"), "nom": f"{c['origine']} ↔ {c['destination']}",
+                "type": c["type"], "operateur": c.get("operateur", "")})
         _construire_sequences_depuis_traces()
-
         RESEAU["charge"] = True
-        log.info(
-            "reseau pret : %d arrets, %d lignes, %d sequences, %d gares",
-            len(RESEAU["arrets"]), len(RESEAU["lignes"]),
-            len(RESEAU["sequences"]), len(RESEAU["gares"]),
-        )
+        log.info("reseau pret : %d arrets, %d lignes, %d sequences, %d gares", len(RESEAU["arrets"]),
+                 len(RESEAU["lignes"]), len(RESEAU["sequences"]), len(RESEAU["gares"]))
 
+# ── 4. ARRÊTS À PROXIMITÉ ──
+def _types_de_l_arret(sid: str) -> set:
+    """Les modes (BUS, GBAKA, BATEAU...) des lignes qui passent à cet arrêt."""
+    return {RESEAU["lignes"][r]["type"] for r in RESEAU["lignes_par_arret"].get(sid, [])
+            if r in RESEAU["lignes"]}
 
-# arrets a proximite 
-
-def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distance: bool = False,
-                     par_nom: bool = True) -> List[dict]:
-    """par_nom=False : garde tous les arrêts d'un même nom (un par sens de la route)."""
+def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distance: bool = False) -> List[dict]:
+    """Arrêts (bus, gbaka, bateau) autour d'un point. Un seul par nom (le plus proche)."""
     if not RESEAU["charge"]:
         charger_reseau_local()
-
     uniques = {}
-    for arret in RESEAU["arrets"].values():
-        d = distance_m(lat, lon, arret["latitude"], arret["longitude"])
-        if d > rayon_m:
+    for a in RESEAU["arrets"].values():
+        d = distance_m(lat, lon, a["latitude"], a["longitude"])
+        types = _types_de_l_arret(a["id"]) & {"BUS", "GBAKA", "BATEAU"}   # jamais les woro-woro
+        if d > rayon_m or not types:
             continue
-        types = set()
-        for rid in RESEAU["lignes_par_arret"].get(arret["id"], []):
-            ligne = RESEAU["lignes"].get(rid)
-            if ligne:
-                types.add(ligne["type"])
-        # on n'affiche que les arrêts de bus, gbaka et bateau-bus (jamais les arrêts de woro-woro)
-        types = types & {"BUS", "GBAKA", "BATEAU"}
-        if not types:
-            continue
-        if "BUS" in types:
-            type_principal = "BUS"
-        elif "GBAKA" in types:
-            type_principal = "GBAKA"
-        else:
-            type_principal = "BATEAU"
-        nom = arret["nom"]
-        cle = nom if par_nom else arret["id"]
-        if cle not in uniques or d < uniques[cle]["distance_m"]:
-            uniques[cle] = {
-                "id": arret["id"], "nom": nom,
-                "latitude": arret["latitude"], "longitude": arret["longitude"],
-                "distance_m": int(d), "type": type_principal, "types": list(types),
-            }
-
-    resultats = list(uniques.values())
-    if tri_par_distance:
-        resultats.sort(key=lambda x: x["distance_m"])
-    else:
-        ordre = {"BUS": 0, "GBAKA": 1, "BATEAU": 2}
-        resultats.sort(key=lambda x: (ordre.get(x["type"], 9), x["distance_m"]))
-    return resultats
-
+        principal = "BUS" if "BUS" in types else ("GBAKA" if "GBAKA" in types else "BATEAU")
+        if a["nom"] not in uniques or d < uniques[a["nom"]]["distance_m"]:
+            uniques[a["nom"]] = {"id": a["id"], "nom": a["nom"], "latitude": a["latitude"],
+                                 "longitude": a["longitude"], "distance_m": int(d),
+                                 "type": principal, "types": list(types)}
+    ordre = {"BUS": 0, "GBAKA": 1, "BATEAU": 2}
+    cle = (lambda x: x["distance_m"]) if tri_par_distance else (lambda x: (ordre.get(x["type"], 9), x["distance_m"]))
+    return sorted(uniques.values(), key=cle)
 
 def arrets_proximite_par_modes(lat: float, lon: float, rayon_m: int = 1500,
-                                modes: Optional[List[str]] = None) -> List[dict]:
+                               modes: Optional[List[str]] = None) -> List[dict]:
+    """Comme arrets_proximite, mais pour les modes demandés, triés du plus proche au plus loin."""
     if not RESEAU["charge"]:
         charger_reseau_local()
-    modes_autorises = set(modes) if modes else {"BUS", "GBAKA", "BATEAU"}
+    modes = set(modes) if modes else {"BUS", "GBAKA", "BATEAU"}
     uniques = {}
-    for arret in RESEAU["arrets"].values():
-        d = distance_m(lat, lon, arret["latitude"], arret["longitude"])
-        if d > rayon_m:
-            continue
-        a_des_modes = False
-        for rid in RESEAU["lignes_par_arret"].get(arret["id"], []):
-            ligne = RESEAU["lignes"].get(rid)
-            if ligne and ligne["type"] in modes_autorises:
-                a_des_modes = True
-                break
-        if a_des_modes:
-            nom = arret["nom"]
-            if nom not in uniques or d < uniques[nom]["distance_m"]:
-                uniques[nom] = {
-                    "id": arret["id"], "nom": nom,
-                    "latitude": arret["latitude"], "longitude": arret["longitude"],
-                    "distance_m": int(d),
-                }
-    resultats = list(uniques.values())
-    resultats.sort(key=lambda x: x["distance_m"])
-    return resultats
-
+    for a in RESEAU["arrets"].values():
+        d = distance_m(lat, lon, a["latitude"], a["longitude"])
+        if d <= rayon_m and _types_de_l_arret(a["id"]) & modes:
+            if a["nom"] not in uniques or d < uniques[a["nom"]]["distance_m"]:
+                uniques[a["nom"]] = {"id": a["id"], "nom": a["nom"], "latitude": a["latitude"],
+                                     "longitude": a["longitude"], "distance_m": int(d)}
+    return sorted(uniques.values(), key=lambda x: x["distance_m"])
 
 def lignes_par_arret(stop_id: str) -> Optional[dict]:
+    """Toutes les lignes qui passent à un arrêt (pour l'écran « arrêts à proximité »)."""
     if not RESEAU["charge"]:
         charger_reseau_local()
     arret = RESEAU["arrets"].get(stop_id)
     if not arret:
         return None
-    lignes = []
-    for rid in RESEAU["lignes_par_arret"].get(stop_id, []):
-        ligne = RESEAU["lignes"].get(rid)
-        if ligne:
-            lignes.append({
-                "id": ligne["id"], "numero": ligne["numero"], "nom": ligne["nom"],
-                "type": ligne["type"], "operateur": ligne["operateur"],
-            })
+    lignes = [{"id": l["id"], "numero": l["numero"], "nom": l["nom"], "type": l["type"],
+               "operateur": l["operateur"]}
+              for l in (RESEAU["lignes"].get(r) for r in RESEAU["lignes_par_arret"].get(stop_id, [])) if l]
     lignes.sort(key=lambda l: (0 if l["type"] == "BUS" else 1, l["numero"] or "zzz"))
     return {"arret": arret, "lignes": lignes}
 
-
-# Prix (lecture CSV uniquement) 
-
-PRIX_CATALOGUE = {}
-_prix_charges = False
-
+# ── 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS ──
+PRIX_CATALOGUE = {}            # (mode, numéro de ligne) -> prix lu dans le CSV
 
 def _norm_num(n) -> str:
     n = str(n or "").strip().upper()
     return str(int(n)) if n.isdigit() else n
 
-
-def _charger_prix_csv():
-    global _prix_charges
-    _prix_charges = True
-    PRIX_CATALOGUE.clear()
-    for fichier, type_ligne, colonne in (("bus.csv", "BUS", "prix_fcfa"),
-                                          ("bateau_bus.csv", "BATEAU", "prix_minimum_fcfa")):
-        chemin = os.path.join(DATA_DIR, fichier)
-        if not os.path.exists(chemin):
-            continue
-        with open(chemin, encoding="utf-8-sig", newline="") as f:
-            for row in csv.DictReader(f, delimiter=";"):
+def _prix_csv(type_ligne, numero):
+    """Prix officiel (bus / bateau-bus) lu dans bus.csv et bateau_bus.csv. None si inconnu."""
+    if not PRIX_CATALOGUE:
+        for fichier, mode, colonne in (("bus.csv", "BUS", "prix_fcfa"),
+                                       ("bateau_bus.csv", "BATEAU", "prix_minimum_fcfa")):
+            for row in _lire_csv(fichier):
                 try:
-                    prix = int(float(row.get(colonne)))
+                    PRIX_CATALOGUE.setdefault((mode, _norm_num(row.get("numero_ligne"))),
+                                              int(float(row.get(colonne))))
                 except Exception:
                     continue
-                PRIX_CATALOGUE.setdefault((type_ligne, _norm_num(row.get("numero_ligne"))), prix)
-
-
-def _prix_csv(type_ligne, numero):
-    if not _prix_charges:
-        _charger_prix_csv()
     return PRIX_CATALOGUE.get((type_ligne, _norm_num(numero)))
 
+def _prix_ligne(ligne) -> int:
+    """Prix d'une ligne pour le calcul (0 pour gbaka/woro : le prix n'est pas fixe)."""
+    if ligne.get("type") not in ("BUS", "BATEAU"):
+        return 0
+    return _prix_csv(ligne["type"], ligne.get("numero")) or 0
 
 def _rids_approximatifs() -> set:
+    """Lignes du catalogue CSV dont une version GTFS plus précise existe : on les ignore."""
     if "rids_approx" not in RESEAU:
-        gtfs = set()
-        for rid, l in RESEAU["lignes"].items():
-            if not str(rid).startswith("cat:") and RESEAU["sequences"].get(rid):
-                gtfs.add((l.get("type"), _norm_num(l.get("numero"))))
-        RESEAU["rids_approx"] = {
-            rid for rid, l in RESEAU["lignes"].items()
-            if str(rid).startswith("cat:") and l.get("type") in ("BUS", "BATEAU")
-            and (l.get("type"), _norm_num(l.get("numero"))) in gtfs
-        }
+        gtfs = {(l.get("type"), _norm_num(l.get("numero"))) for rid, l in RESEAU["lignes"].items()
+                if not str(rid).startswith("cat:") and RESEAU["sequences"].get(rid)}
+        RESEAU["rids_approx"] = {rid for rid, l in RESEAU["lignes"].items()
+                                 if str(rid).startswith("cat:") and l.get("type") in ("BUS", "BATEAU")
+                                 and (l.get("type"), _norm_num(l.get("numero"))) in gtfs}
     return RESEAU["rids_approx"]
 
+def _etapes_transport(c: dict) -> list:
+    """Les étapes en véhicule d'un trajet (sans la marche ni le woro-woro d'approche)."""
+    return [e for e in c.get("etapes", []) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
+
+def _acces_m(c: dict) -> int:
+    """Distance à pied (ou en woro-woro d'approche) d'un trajet."""
+    return c.get("marche_m", 0) + sum(e.get("distance_m", 0) for e in c.get("etapes", [])
+                                       if e.get("mode") == "WORO_WORO")
+
+def _nom_court_ligne(e: dict) -> str:
+    if e.get("numero_ligne"):
+        return str(e["numero_ligne"])
+    nom = str(e.get("nom_ligne") or "").replace("gbaka :", "").strip()
+    return nom or NOM_MODE.get(e.get("mode"), "ligne")
 
 def _finaliser_candidat(c: dict):
-    connus, inconnu = 0, False
-    for e in c["etapes"]:
-        if e["mode"] == "MARCHE":
-            continue
-        p = e.get("cout_fcfa")
-        if p is None:
-            inconnu = True
-        else:
-            connus += p
-    c["cout_partiel_fcfa"] = connus
-    c["cout_fcfa"] = None if inconnu else connus
-    c["prix_inconnu"] = inconnu
+    """Calcule le coût total (None si un prix est inconnu, ex : gbaka) et le nombre d'arrêts."""
+    prix = [e.get("cout_fcfa") for e in c["etapes"] if e["mode"] != "MARCHE"]
+    c["cout_partiel_fcfa"] = sum(p for p in prix if p is not None)
+    c["prix_inconnu"] = any(p is None for p in prix)
+    c["cout_fcfa"] = None if c["prix_inconnu"] else c["cout_partiel_fcfa"]
     c["nb_arrets"] = sum(e.get("nb_arrets", 0) for e in c["etapes"] if e["mode"] != "MARCHE")
 
-
-def _cout_tri(c: dict) -> int:
-    return c.get("cout_partiel_fcfa", 0)
-
-
-_LIBELLES_MODE = {"BUS": "bus", "GBAKA": "gbaka", "WORO_WORO": "woro-woro", "BATEAU": "bateau-bus"}
-
+def _normaliser_candidat(c: dict):
+    """Prix officiels pour bus/bateau, inconnu pour gbaka, puis totaux."""
+    for e in c.get("etapes", []):
+        if e.get("mode") == "MARCHE":
+            continue
+        if e.get("nb_arrets") is None:
+            e["nb_arrets"] = max(0, len(e["arrets"]) - 1) if e.get("arrets") else 0
+        e["cout_fcfa"] = _prix_csv(e["mode"], e.get("numero_ligne")) if e["mode"] in ("BUS", "BATEAU") else None
+    _finaliser_candidat(c)
 
 def _ajouter_textes(c: dict):
+    """Écrit la phrase de chaque étape (« Marchez 120 m jusqu'à l'arrêt X »...)."""
     etapes = c.get("etapes", [])
-    n = len(etapes)
     for i, e in enumerate(etapes):
         if e["mode"] == "MARCHE":
             d = int(e.get("distance_m", 0))
             if i == 0:
-                if d < 10:
-                    e["texte"] = f"Vous êtes déjà à l'arrêt {e['arrivee']} (point de montée)."
-                else:
-                    e["texte"] = f"Marchez {d} m jusqu'à l'arrêt {e['arrivee']} (point de montée)."
-            elif i == n - 1:
+                e["texte"] = (f"Vous êtes déjà à l'arrêt {e['arrivee']} (point de montée)." if d < 10 else
+                              f"Marchez {d} m jusqu'à l'arrêt {e['arrivee']} (point de montée).")
+            elif i == len(etapes) - 1:
                 e["texte"] = f"Marchez {d} m jusqu'à votre destination."
             else:
                 e["texte"] = f"Marchez {d} m de {e['depart']} à {e['arrivee']} pour la correspondance."
         else:
-            lib = _LIBELLES_MODE.get(e["mode"], e["mode"].lower())
+            lib = NOM_MODE.get(e["mode"], e["mode"].lower())
             ligne = str(e.get("numero_ligne") or e.get("nom_ligne") or "")
             for prefixe in ("gbaka :", "gbaka:", "woro-woro :", "woro :"):
                 if ligne.lower().startswith(prefixe):
@@ -1082,108 +741,62 @@ def _ajouter_textes(c: dict):
                 e["texte"] = (f"Prenez un woro-woro ou un gbaka depuis {depart} jusqu'à {e['arrivee']} "
                               f"(prix variable selon le chauffeur).")
             else:
-                e["texte"] = f"Montez à {e['depart']} dans le {lib} {ligne}, descendez à {e['arrivee']}{suite}.".replace("  ", " ").replace(" ,", ",")
+                e["texte"] = (f"Montez à {e['depart']} dans le {lib} {ligne}, descendez à "
+                              f"{e['arrivee']}{suite}.").replace("  ", " ").replace(" ,", ",")
         if e.get("conseil"):
             e["texte"] += " " + e["conseil"]
 
-
-_MODE_COURT = {"BUS": "bus", "GBAKA": "gbaka", "WORO_WORO": "woro-woro", "BATEAU": "bateau-bus"}
-
-
-def _nom_court_ligne(e: dict) -> str:
-    num = e.get("numero_ligne")
-    if num:
-        return str(num)
-    nom = str(e.get("nom_ligne") or "").replace("gbaka :", "").strip()
-    return nom or _MODE_COURT.get(e.get("mode"), "ligne")
-
-
-def _etapes_transport(c: dict) -> list:
-    return [e for e in c.get("etapes", []) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
-
-
-def _acces_m(c: dict) -> int:
-    return c.get("marche_m", 0) + sum(e.get("distance_m", 0) for e in c.get("etapes", [])
-                                       if e.get("mode") == "WORO_WORO")
-
-
 # Trajets déjà proposés à exclure quand l'utilisateur dit « pas celui-là, autre chose ».
-# (ContextVar : valable seulement pour la requête en cours, aucun changement nécessaire dans main.py)
+# (ContextVar : valable seulement pour la requête en cours, aucun changement dans main.py)
 _EXCLURE = contextvars.ContextVar("mobigo_exclure", default=None)
 
-
-def _pos_proches(p, q, seuil_m: int = 500) -> bool:
-    if not p or not q:
-        return False
-    return distance_m(p["latitude"], p["longitude"], q["latitude"], q["longitude"]) <= seuil_m
-
-
 def _quasi_identiques(a: dict, b: dict) -> bool:
-    """Deux trajets qui font pratiquement la même chose (mêmes modes, mêmes montées et descentes
-    à moins de 500 m l'une de l'autre) = un seul trajet pour l'utilisateur."""
+    """Deux trajets presque identiques (mêmes modes, mêmes montées/descentes à ≤ 500 m)."""
     ta, tb = _etapes_transport(a), _etapes_transport(b)
     if not ta or len(ta) != len(tb):
         return False
-    for x, y in zip(ta, tb):
-        if x.get("mode") != y.get("mode"):
-            return False
-        mem_dep = x.get("depart") == y.get("depart") or _pos_proches(x.get("depart_pos"), y.get("depart_pos"))
-        mem_arr = x.get("arrivee") == y.get("arrivee") or _pos_proches(x.get("arrivee_pos"), y.get("arrivee_pos"))
-        if not (mem_dep and mem_arr):
-            return False
-    return True
 
+    def proches(p, q):
+        return bool(p and q) and distance_m(p["latitude"], p["longitude"], q["latitude"], q["longitude"]) <= 500
+    return all(x.get("mode") == y.get("mode")
+               and (x.get("depart") == y.get("depart") or proches(x.get("depart_pos"), y.get("depart_pos")))
+               and (x.get("arrivee") == y.get("arrivee") or proches(x.get("arrivee_pos"), y.get("arrivee_pos")))
+               for x, y in zip(ta, tb))
 
-# choisir_propositions (Option 1 · bus X puis bus Y) 
 def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
-                          priorite=None, budget=None, maxi: int = 4) -> list:
-    """Propositions logiques et distinctes :
-    1. plus petit nombre de correspondances d'abord (jamais 3-4 bus si moins suffit) ;
-    2. regroupe les trajets qui partagent la même montée et le même point de correspondance ;
-    3. en mode TOUS, ajoute un autre mode UNIQUEMENT s'il reste compétitif (+50 % max)."""
+                         priorite=None, budget=None, maxi: int = 4) -> list:
+    """Choisit les 4 meilleures propositions, logiques et différentes :
+    1. le moins de correspondances d'abord ; 2. on regroupe les trajets presque identiques ;
+    3. en mode TOUS, on ajoute un autre mode seulement s'il n'est pas trop long (+50 % max)."""
     cands = [c for c in (candidats or []) if _etapes_transport(c)]
     if budget:
         cands = [c for c in cands if c.get("cout_partiel_fcfa", 0) <= budget]
+    deja_proposes = _EXCLURE.get()
+    if deja_proposes:                                  # « autre chose » : on retire ce qui a déjà été proposé
+        cands = [c for c in cands if not any(_quasi_identiques(c, p) for p in deja_proposes)]
     if not cands:
         return []
-    # « je ne veux pas ce trajet » : on retire ce qui ressemble aux trajets déjà proposés
-    deja_proposes = _EXCLURE.get()
-    if deja_proposes:
-        cands = [c for c in cands if not any(_quasi_identiques(c, p) for p in deja_proposes)]
-        if not cands:
-            return []
 
     def marche_finale(c):
         e = c["etapes"][-1]
         return e.get("distance_m", 0) if e.get("mode") == "MARCHE" else 0
-
     courtes = [c for c in cands if marche_finale(c) <= SEUIL_MARCHE_LONGUE_M]
-    if courtes:
-        cands = courtes
+    cands = courtes or cands
 
-    def eff(c):
-        # être déposé à plus de 500 m de la destination, ou devoir marcher plus de 1000 m avant de monter,
-        # "coûte" comme une correspondance de plus : un trajet avec 1 correspondance qui dépose à l'arrêt voisin
-        # vaut mieux qu'un direct qui dépose loin (ou qu'un détour pour aller chercher un arrêt éloigné)
-        return (c.get("nb_correspondances", 0) + (marche_finale(c) > MARCHE_FINALE_OK_M)
-                + (_acces_m(c) > SEUIL_MARCHE_LONGUE_M))
-
-    def cle(c):
-        base = c.get("nb_arrets", 0) + (_acces_m(c) + marche_finale(c)) / 200.0
+    def cle(c):                                        # plus petit = meilleur
+        base = c.get("nb_arrets", 0) + _acces_m(c) / 200.0
+        corr, duree = c.get("nb_correspondances", 0), c.get("duree_minutes", 999)
         if priorite == "prix":
-            return (eff(c), c.get("cout_partiel_fcfa", 0), base, c.get("duree_minutes", 999))
-        if priorite == "duree":
-            return (eff(c), c.get("duree_minutes", 999), base)
-        return (eff(c), base, c.get("duree_minutes", 999))
+            return (corr, c.get("cout_partiel_fcfa", 0), base, duree)
+        return (corr, duree, base) if priorite == "duree" else (corr, base, duree)
 
     def famille(c):
         return frozenset(e["mode"] for e in _etapes_transport(c))
 
-    def cle_groupe(c):
+    def cle_groupe(c):                                 # deux trajets de même clé = même proposition
         tr = _etapes_transport(c)
         if len(tr) == 1:
             return ("D", tr[0]["depart"], tr[0]["arrivee"])
-        # gbaka / woro-woro : pour l'utilisateur, deux lignes qui font les mêmes arrêts = le même trajet
         return tuple((e["mode"], "" if e["mode"] in ("GBAKA", "WORO_WORO") else _nom_court_ligne(e),
                       e["depart"], e["arrivee"]) for e in tr[:-1]) + (tr[-1]["depart"],)
 
@@ -1191,38 +804,27 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         groupes = {}
         for c in sorted(liste, key=cle):
             groupes.setdefault(cle_groupe(c), []).append(c)
-        tries = sorted(groupes.values(), key=lambda g: cle(g[0]))
-        # fusionne les quasi-doublons : même trajet, juste une autre ligne ou un arrêt voisin
         fusion = []
-        for g in tries:
-            for k in fusion:
+        for g in sorted(groupes.values(), key=lambda g: cle(g[0])):
+            for k in fusion:                           # quasi-doublon : on fusionne
                 if _quasi_identiques(k[0], g[0]):
                     k.extend(g)
                     break
             else:
                 fusion.append(g)
         return fusion
-
-    mini = min(eff(c) for c in cands)
-    groupes = grouper([c for c in cands if eff(c) == mini])
-    choisis = groupes[:maxi]
-
-    # ── Diversité : UNIQUEMENT si le mode demandé = TOUS ──
-    if mode_filtre == "TOUS" and choisis:
+    mini = min(c.get("nb_correspondances", 0) for c in cands)
+    choisis = grouper([c for c in cands if c.get("nb_correspondances", 0) == mini])[:maxi]
+    if mode_filtre == "TOUS" and choisis:              # on ajoute de la variété (autre mode)
         deja = {m for g in choisis for m in famille(g[0])}
         dur_ref = choisis[0][0].get("duree_minutes", 999) or 999
-        autres = grouper([c for c in cands if eff(c) <= mini + 1])
-        for g in autres:
+        for g in grouper([c for c in cands if c.get("nb_correspondances", 0) <= mini + 1]):
             if len(choisis) >= maxi:
                 break
-            if (famille(g[0]) - deja) and all(g is not x for x in choisis):
-                # n'ajoute un autre mode que si le trajet n'est pas trop dégradé (max +50 %)
-                if (g[0].get("duree_minutes", 999) or 999) <= dur_ref * 1.5:
-                    choisis.append(g)
-                    deja |= famille(g[0])
-        if len(choisis) > maxi:
-            choisis = choisis[:maxi]
-
+            if (famille(g[0]) - deja) and all(g is not x for x in choisis) \
+                    and (g[0].get("duree_minutes", 999) or 999) <= dur_ref * 1.5:
+                choisis.append(g)
+                deja |= famille(g[0])
     resultat = []
     for n, g in enumerate(choisis, 1):
         rep = copy.deepcopy(g[0])
@@ -1231,14 +833,13 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         noms = []
         for e in tr:
             nom_l = _nom_court_ligne(e)
-            if len(nom_l) > 26:
-                nom_l = nom_l[:25].rstrip() + "…"
-            noms.append(f"{_MODE_COURT.get(e['mode'], e['mode'].lower())} {nom_l}".strip())
+            nom_l = nom_l[:25].rstrip() + "…" if len(nom_l) > 26 else nom_l
+            noms.append(f"{NOM_MODE.get(e['mode'], e['mode'].lower())} {nom_l}".strip())
         rep["libelle"] = f"Option {n} · " + " puis ".join(noms)
         nb_c = rep.get("nb_correspondances", 0)
-        rep["resume"] = ("Trajet direct" if nb_c == 0 else
-                         f"{nb_c} correspondance{'s' if nb_c > 1 else ''}") + \
-                        f" · {rep.get('nb_arrets', 0)} arrêts"
+        rep["resume"] = (("Trajet direct" if nb_c == 0 else f"{nb_c} correspondance{'s' if nb_c > 1 else ''}")
+                         + f" · {rep.get('nb_arrets', 0)} arrêts")
+        # autres lignes qui font le même trajet (même arrêt de descente) : proposées en « alternatives »
         alternatives, vus = [], {_nom_court_ligne(derniere)}
         for autre in g[1:]:
             ta = _etapes_transport(autre)[-1]
@@ -1247,1327 +848,703 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
                 continue
             vus.add(nom)
             alternatives.append({"ligne": nom, "mode": ta["mode"], "nb_arrets": ta.get("nb_arrets", 0)})
-        alternatives.sort(key=lambda a: a["nb_arrets"])
-        rep["alternatives"] = alternatives[:5]
+        alternatives = sorted(alternatives, key=lambda a: a["nb_arrets"])[:5]
+        rep["alternatives"] = alternatives
         if alternatives:
-            liste = ", ".join(f"{_MODE_COURT.get(a['mode'], a['mode'].lower())} {a['ligne']}"
-                              + (f" ({a['nb_arrets']} arrêts)" if a["nb_arrets"] else "")
-                              for a in alternatives[:5])
+            liste = ", ".join(f"{NOM_MODE.get(a['mode'], a['mode'].lower())} {a['ligne']}"
+                              + (f" ({a['nb_arrets']} arrêts)" if a["nb_arrets"] else "") for a in alternatives)
             derniere["texte"] = (derniere.get("texte") or "") + \
                 f" Autres lignes possibles depuis le même arrêt : {liste}."
         resultat.append(rep)
     return resultat
 
+# ── 6. CONSTRUCTION DES TRAJETS ──
+@functools.lru_cache(maxsize=None)
+def _arrets_proches_de(sid: str, rayon_m: float = 300) -> tuple:
+    """Arrêts à moins de rayon_m d'un arrêt donné (pour les correspondances à pied)."""
+    if "grille_corr" not in RESEAU:
+        RESEAU["grille_corr"] = _grille_arrets(0.003, [s for s in RESEAU["arrets"]
+                                                       if RESEAU["lignes_par_arret"].get(s)])
+    a = RESEAU["arrets"][sid]
+    res = []
+    for autre in _voisins(RESEAU["grille_corr"], a["latitude"], a["longitude"], 0.003):
+        b = RESEAU["arrets"][autre]
+        d = _dist_rapide(a["latitude"], a["longitude"], b["latitude"], b["longitude"])
+        if d <= rayon_m:
+            res.append((autre, d))
+    return tuple(res)
 
-
-def _normaliser_candidat(c: dict):
-    for e in c.get("etapes", []):
-        if e.get("mode") == "MARCHE":
-            continue
-        if e.get("nb_arrets") is None:
-            e["nb_arrets"] = max(0, len(e["arrets"]) - 1) if e.get("arrets") else 0
-        if e["mode"] in ("BUS", "BATEAU"):
-            e["cout_fcfa"] = _prix_csv(e["mode"], e.get("numero_ligne"))
-        else:
-            e["cout_fcfa"] = None
-    _finaliser_candidat(c)
-
-
-def conseil_marche_chat(options: list) -> str:
-    conseils, vus = [], set()
-    for c in options or []:
-        for i, e in enumerate(c.get("etapes", [])):
-            if e.get("mode") != "MARCHE" or e.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
+def _lignes_voisines() -> dict:
+    """Pour chaque ligne : les lignes qu'on peut prendre en correspondance (arrêts à ≤ 250 m)."""
+    if "voisines" not in RESEAU:
+        voisines, approx = defaultdict(set), _rids_approximatifs()
+        ok = lambda r: r not in approx and RESEAU["lignes"].get(r, {}).get("type") != "WORO_WORO"
+        for rid, sequences in RESEAU["sequences"].items():
+            if not ok(rid):
                 continue
-            if not e.get("depart_pos") or not e.get("arrivee_pos"):
-                continue
-            cle = (e.get("depart"), e.get("arrivee"))
-            if cle in vus:
-                continue
-            vus.add(cle)
-            km = e["distance_m"] / 1000
-            lignes = _lignes_libres_proches(e["depart_pos"], e["arrivee_pos"])
-            if lignes:
-                genre = "gbaka" if lignes[0][0] == "GBAKA" else "woro-woro"
-                conseils.append(f"la marche de {km:.1f} km vers {e['arrivee']} est longue : "
-                                f"le {genre} « {lignes[0][1]} » passe dans ce secteur "
-                                f"(prix variable selon le chauffeur)")
-            else:
-                conseils.append(f"la marche de {km:.1f} km vers {e['arrivee']} est longue "
-                                f"et je n'ai pas de gbaka/woro-woro connu sur ce tronçon : "
-                                f"prévois de marcher")
-            if len(conseils) >= 2:
-                return " ; ".join(conseils)
-    return " ; ".join(conseils)
+            for sid in [x for x in sequences[0] if x not in RESEAU["points_libres"]][::2]:
+                for autre, _ in _arrets_proches_de(sid, 250):
+                    voisines[rid].update(r2 for r2 in RESEAU["lignes_par_arret"].get(autre, []) if r2 != rid and ok(r2))
+        RESEAU["voisines"] = voisines
+    return RESEAU["voisines"]
 
-
-def _signature_candidat(c: dict) -> tuple:
-    return tuple((e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
-                  e.get("depart"), e.get("arrivee"))
-                 for e in c.get("etapes", []) if e.get("mode") != "MARCHE")
-
-
-def candidats_multimodaux(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> list:
-    """Mode imposé → UNIQUEMENT ce mode. Sinon : tous les modes combinés
-    (bus + gbaka + bateau-bus + trajets mixtes)."""
-    if mode_filtre in ("BUS", "GBAKA", "BATEAU"):
-        autorises = {"BUS": {"BUS"}, "GBAKA": {"GBAKA", "WORO_WORO"}, "BATEAU": {"BATEAU"}}[mode_filtre]
-
-        def modes_du_trajet(c):
-            return {e["mode"] for e in c.get("etapes", []) if e["mode"] != "MARCHE"}
-
-        out = construire_candidats(dep, dest, mode_filtre, prix_max_ligne)
-        purs = [c for c in out if modes_du_trajet(c) <= autorises]
-        if not purs:
-            # aucun trajet 100 % dans ce mode : on cherche des trajets qui le COMBINENT avec un autre
-            mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
-            purs = [c for c in mixtes if modes_du_trajet(c) & autorises and not modes_du_trajet(c) <= autorises]
-            for c in purs:
-                c["combo_mode"] = mode_filtre
-        for c in purs:
-            _ajouter_textes(c)
-        return purs
-    out, vus = [], set()
-    groupes = [construire_candidats(dep, dest, "TOUS", prix_max_ligne)]
-    par_mode = trajets_par_mode(dep, dest, prix_max_ligne)
-    groupes += [par_mode.get("bus", []), par_mode.get("gbakas", []), par_mode.get("bateaux", [])]
-    for groupe in groupes:
-        for c in groupe:
-            sig = _signature_candidat(c)
-            if sig in vus:
-                continue
-            vus.add(sig)
-            _ajouter_textes(c)
-            out.append(c)
-    return out
-
-
-def arrets_proches_trajet(dep: dict, dest: dict, mode_filtre: str = "TOUS", rayon_m: int = 3000) -> dict:
-    modes = None if mode_filtre == "TOUS" else [mode_filtre]
-    arr_dep = arrets_proximite_par_modes(dep["latitude"], dep["longitude"], rayon_m, modes)
-    arr_arr = arrets_proximite_par_modes(dest["latitude"], dest["longitude"], rayon_m, modes)
-    return {"depart": arr_dep[:5], "arrivee": arr_arr[:5]}
-
-
-def _prix_ligne(ligne) -> int:
-    if ligne.get("type") not in ("BUS", "BATEAU"):
-        return 0
-    return _prix_csv(ligne["type"], ligne.get("numero")) or 0
-
-
-def _lignes_passant_par(arret_id: str, modes_autorises: set) -> list:
-    resultats = []
-    approx = _rids_approximatifs()
-    for rid in RESEAU["lignes_par_arret"].get(arret_id, []):
-        if rid in approx:
+def _lignes_proches(point: dict, rayon_m: float, modes: set) -> dict:
+    """TOUTES les lignes (bus, gbaka, bateau) qui passent à moins de rayon_m d'un point.
+    Pour chaque ligne on garde SON arrêt le plus proche du point.
+    Résultat : {(id_ligne, n° du sens): (id_arret, distance_m, rang_dans_la_sequence)}"""
+    approx, res = _rids_approximatifs(), {}
+    for a in RESEAU["arrets"].values():
+        d = distance_m(point["latitude"], point["longitude"], a["latitude"], a["longitude"])
+        if d > rayon_m:
             continue
-        ligne = RESEAU["lignes"].get(rid)
-        if not ligne or ligne["type"] not in modes_autorises:
-            continue
-        if ligne["type"] == "WORO_WORO":
-            continue
-        sequences = RESEAU["sequences"].get(rid, [])
-        for seq in sequences:
-            if arret_id in seq:
-                resultats.append({"ligne": ligne, "rid": rid, "sequence": seq})
-    return resultats
-
-
-def _est_terminus_depart(rid: str, sid: str) -> bool:
-    for seq in RESEAU["sequences"].get(rid, []):
-        if seq and seq[0] == sid:
-            return True
-    return False
-
-
-def _segment_sur_ligne(sequence: list, montee_id: str, descente_id: str):
-    if montee_id not in sequence or descente_id not in sequence:
-        return None
-    i = sequence.index(montee_id)
-    apres = [k for k, sid in enumerate(sequence) if sid == descente_id and k > i]
-    if not apres:
-        return None
-    return sequence[i:apres[0] + 1]
-
-
-# _arrets_utiles — équilibre PAR MODE 
-def _arrets_utiles(arrets: list, modes: set, maxi: int = 60) -> list:
-    """Garde les arrêts utiles pour le routage, en assurant une représentation
-    de CHAQUE mode (sinon, entouré de bus, aucun gbaka / bateau-bus n'est retenu
-    et les trajets multimodaux n'apparaissent jamais)."""
-    modes_reels = {m for m in modes if m != "WORO_WORO"}
-    if not modes_reels:
-        return []
-
-    par_mode = {m: [] for m in modes_reels}
-    for a in arrets:
-        types = set()
-        for rid in RESEAU["lignes_par_arret"].get(a["id"], []):
+        for rid in RESEAU["lignes_par_arret"].get(a["id"], ()):
             ligne = RESEAU["lignes"].get(rid)
-            if ligne and ligne["type"] in modes_reels:
-                types.add(ligne["type"])
-        for t in types:
-            par_mode[t].append(a)
+            if rid in approx or not ligne or ligne["type"] not in modes or ligne["type"] == "WORO_WORO":
+                continue
+            for s, seq in enumerate(RESEAU["sequences"].get(rid, [])):
+                if a["id"] in seq and ((rid, s) not in res or d < res[(rid, s)][1]):
+                    res[(rid, s)] = (a["id"], int(d), seq.index(a["id"]))
+    return res
 
-    gardes, vus_ids, lignes_vues = [], set(), set()
-
-    def ajouter(a):
-        if a["id"] in vus_ids:
-            return False
-        nouvelles = {(rid, k) for rid in RESEAU["lignes_par_arret"].get(a["id"], [])
-                     if (l := RESEAU["lignes"].get(rid)) and l["type"] in modes_reels
-                     for k, sq in enumerate(RESEAU["sequences"].get(rid, [])) if a["id"] in sq} - lignes_vues
-        if not nouvelles:
-            return False
-        gardes.append(a)
-        vus_ids.add(a["id"])
-        lignes_vues.update(nouvelles)
-        return True
-
-    quota = min(10, max(2, maxi // len(modes_reels)))
-    for mode in modes_reels:
-        count = 0
-        for a in par_mode[mode]:
-            if len(gardes) >= maxi:
-                break
-            if ajouter(a):
-                count += 1
-                if count >= quota:
-                    break
-
-    for a in arrets:
-        if len(gardes) >= maxi:
-            break
-        ajouter(a)
-
-    ordre = {a["id"]: i for i, a in enumerate(arrets)}
-    gardes.sort(key=lambda a: ordre.get(a["id"], 10**9))
+def _garder_par_mode(lignes: dict, n: int = 12) -> list:
+    """Garde, pour chaque mode (bus, gbaka, bateau), les n lignes dont l'arrêt est le plus proche."""
+    gardes = []
+    for mode in ("BUS", "GBAKA", "BATEAU"):
+        gardes += sorted((kv for kv in lignes.items() if RESEAU["lignes"][kv[0][0]]["type"] == mode),
+                         key=lambda kv: kv[1][1])[:n]
     return gardes
 
+def _meilleure_descente(seq: list, i_montee: int, dest: dict, maxi_m: float):
+    """Après la montée, quel arrêt de la ligne est le plus proche de la destination ?
+    Retourne (rang, distance) ou None si tous sont à plus de maxi_m."""
+    meilleur = None
+    for j in range(i_montee + 1, len(seq)):
+        a = RESEAU["arrets"].get(seq[j])
+        if a:
+            d = distance_m(dest["latitude"], dest["longitude"], a["latitude"], a["longitude"])
+            if meilleur is None or d < meilleur[1]:
+                meilleur = (j, d)
+    return meilleur if meilleur and meilleur[1] <= maxi_m else None
+
+def _meilleur_transfert(seq_a, apres_a, seq_b, avant_b, rayon=300, ligne_b_bus=False):
+    """Meilleur endroit pour passer de la ligne A à la ligne B (arrêts proches à pied).
+    Retourne (rang de descente sur A, rang de montée sur B, distance à pied, id_A, id_B)."""
+    pos_b = {}
+    for k, sid in enumerate(seq_b):
+        if k <= avant_b and sid not in pos_b:
+            pos_b[sid] = k
+    meilleur = None
+    for i in range(apres_a + 1, len(seq_a)):
+        if seq_a[i] in RESEAU["points_libres"]:
+            continue
+        for autre, d in _arrets_proches_de(seq_a[i], max(rayon, 800) if ligne_b_bus else rayon):
+            k = pos_b.get(autre)
+            if k is None:
+                continue
+            terminus = ligne_b_bus and k == 0          # monter au terminus de la ligne B : on tolère 800 m
+            if d > rayon and not (terminus and d <= 800):
+                continue
+            score = (i - apres_a) + (avant_b - k) + d / 150.0 - (4 if terminus else 0)
+            if not meilleur or score < meilleur[0]:
+                meilleur = (score, i, k, d, seq_a[i], autre)
+    return meilleur[1:] if meilleur else None
+
+def _pos(a: dict) -> dict:
+    return {"latitude": a["latitude"], "longitude": a["longitude"]}
+
+def _etape_marche(nom_dep, nom_arr, p, q, distance, minimum=1) -> dict:
+    return {"mode": "MARCHE", "depart": nom_dep, "arrivee": nom_arr, "distance_m": int(distance),
+            "duree_minutes": max(minimum, int(distance) // 80), "cout_fcfa": 0,
+            "depart_pos": _pos(p), "arrivee_pos": _pos(q)}
 
 def _duree_sur_ligne(ids: list) -> int:
-    total = 0.0
-    for a, b in zip(ids, ids[1:]):
-        p, q = RESEAU["arrets"].get(a), RESEAU["arrets"].get(b)
-        if p and q:
-            total += _dist_rapide(p["latitude"], p["longitude"], q["latitude"], q["longitude"])
+    """Durée en minutes : on compte 350 m par minute le long des arrêts."""
+    total = sum(_dist_rapide(RESEAU["arrets"][a]["latitude"], RESEAU["arrets"][a]["longitude"],
+                             RESEAU["arrets"][b]["latitude"], RESEAU["arrets"][b]["longitude"])
+                for a, b in zip(ids, ids[1:]) if a in RESEAU["arrets"] and b in RESEAU["arrets"])
     return max(5, int(total // 350))
 
+def _assembler(dep: dict, dest: dict, trajets_lignes: list) -> dict:
+    """Fabrique un trajet complet à partir d'une liste de (id_ligne, arrêts_parcourus) :
+    marche -> ligne 1 -> (marche -> ligne 2 ...) -> marche. Calcule durée, marche, correspondances."""
+    A = RESEAU["arrets"]
+    etapes = []
+    precedent = None                                   # (nom, position) du dernier point où l'on se trouve
+    precedent_pos, precedent_nom = dep, dep.get("nom", "depart")
+    for n, (rid, ids) in enumerate(trajets_lignes):
+        m, d, ligne = A[ids[0]], A[ids[-1]], RESEAU["lignes"][rid]
+        d_marche = distance_m(precedent_pos["latitude"], precedent_pos["longitude"], m["latitude"], m["longitude"])
+        etapes.append(_etape_marche(precedent_nom, m["nom"], precedent_pos, m, d_marche, 2 if n else 1))
+        etape = {"mode": ligne["type"], "numero_ligne": ligne.get("numero"), "nom_ligne": ligne.get("nom"),
+                 "depart": m["nom"], "arrivee": d["nom"], "depart_pos": _pos(m), "arrivee_pos": _pos(d),
+                 "distance_m": distance_m(m["latitude"], m["longitude"], d["latitude"], d["longitude"]),
+                 "duree_minutes": _duree_sur_ligne(ids), "cout_fcfa": _prix_ligne(ligne),
+                 "nb_arrets": len(ids) - 1}
+        if len(trajets_lignes) == 1:                   # trajet direct : on détaille tous les arrêts
+            etape["arrets"] = [{"id": s, "nom": A[s]["nom"], "latitude": A[s]["latitude"],
+                                "longitude": A[s]["longitude"]} for s in ids if s in A]
+        etapes.append(etape)
+        precedent_pos, precedent_nom = d, d["nom"]
+    d_fin = distance_m(precedent_pos["latitude"], precedent_pos["longitude"], dest["latitude"], dest["longitude"])
+    etapes.append(_etape_marche(precedent_nom, dest.get("nom", "destination"), precedent_pos, dest, d_fin))
+    return {"duree_minutes": sum(e["duree_minutes"] for e in etapes),
+            "cout_fcfa": sum(e["cout_fcfa"] for e in etapes),
+            "marche_m": sum(e["distance_m"] for e in etapes if e["mode"] == "MARCHE"),
+            "nb_correspondances": len(trajets_lignes) - 1, "etapes": etapes,
+            "arrets_itineraire": etapes[1].get("arrets", []) if len(trajets_lignes) == 1 else []}
 
-ATTENTE_MINUTES = {"BUS": 8, "GBAKA": 3, "WORO_WORO": 3, "BATEAU": 15}
-SEUIL_MARCHE_LONGUE_M = 1000
-MARCHE_FINALE_OK_M = 500
+def _score_trajet(c: dict) -> int:
+    """Plus petit = meilleur : durée + (marche convertie en minutes)."""
+    return c["duree_minutes"] + c.get("marche_m", 0) // 160
 
+def _candidats_deux_correspondances(dep, dest, departs, arrivees, prix_max_ligne=None) -> list:
+    """Trajets avec 2 correspondances (3 lignes) : ligne 1 -> ligne 2 -> ligne 3."""
+    voisines, A = _lignes_voisines(), RESEAU["arrets"]
+    seqs = RESEAU["sequences"]
+    par_rid_arr = defaultdict(list)
+    for (r, s), v in arrivees.items():
+        par_rid_arr[r].append((s, v))
+    resultats, essais = {}, 0
+    for (r1, s1), (sid1, _, i1) in sorted(departs.items(), key=lambda kv: kv[1][1])[:25]:
+        for r2 in voisines.get(r1, ()):
+            for r3 in voisines.get(r2, ()):
+                if r3 in (r1, r2) or r3 not in par_rid_arr:
+                    continue
+                essais += 1
+                if essais > 400:
+                    return list(resultats.values())
+                if prix_max_ligne and max(_prix_ligne(RESEAU["lignes"][r]) for r in (r1, r2, r3)) > prix_max_ligne:
+                    continue
+                seq1 = seqs[r1][s1]
+                for seq2 in seqs[r2]:
+                    for s3, (_, _, k_desc) in sorted(par_rid_arr[r3], key=lambda x: x[1][1])[:3]:
+                        seq3 = seqs[r3][s3]
+                        t1 = _meilleur_transfert(seq1, i1, seq2, len(seq2) - 2)
+                        t2 = _meilleur_transfert(seq2, t1[1], seq3, k_desc - 1) if t1 else None
+                        if not t2:
+                            continue
+                        ids = [seq1[i1:t1[0] + 1], seq2[t1[1]:t2[0] + 1], seq3[t2[1]:k_desc + 1]]
+                        if any(len(x) < 2 or _dist_rapide(A[x[0]]["latitude"], A[x[0]]["longitude"],
+                                                          A[x[-1]]["latitude"], A[x[-1]]["longitude"]) < 1500
+                               for x in ids):          # une ligne trop courte ne vaut pas le détour
+                            continue
+                        cand = _assembler(dep, dest, list(zip((r1, r2, r3), ids)))
+                        if (r1, r2, r3) not in resultats or _score_trajet(cand) < _score_trajet(resultats[(r1, r2, r3)]):
+                            resultats[(r1, r2, r3)] = cand
+    return list(resultats.values())
 
-def _trajet_correct(c: dict) -> bool:
-    """Marche de départ raisonnable ET descente à moins de 500 m de la destination."""
-    e = c["etapes"]
-    fin = e[-1].get("distance_m", 0) if e[-1]["mode"] == "MARCHE" else 0
-    return e[0].get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M and fin <= MARCHE_FINALE_OK_M
+def _candidats_depuis_catalogue(dep, dest, modes, arrets_dep, arrets_arr) -> list:
+    """Dernier recours : lignes du catalogue CSV sans séquence d'arrêts. On les accepte si un arrêt
+    proche du départ ET un arrêt proche de la destination sont sur son tracé et dans ses noms."""
+    def lie(arrets, nom_ligne):                        # un arrêt dont le nom ressemble au terminus
+        for a in arrets:
+            nom = nettoyer_texte(a["nom"])
+            if any(m in nom for m in nom_ligne.split() if len(m) > 3) or \
+               any(m in nom_ligne for m in nom.split() if len(m) > 3):
+                return a
+        return None
+    sortie = []
+    for c in CATALOGUE:
+        ori, des = nettoyer_texte(c.get("origine") or ""), nettoyer_texte(c.get("destination") or "")
+        if c["type"] not in modes or not ori or not des or not c.get("trace") or not c.get("bbox"):
+            continue
+        montee, descente = lie(arrets_dep, ori), lie(arrets_arr, des)
+        if not (montee and descente):                  # on essaie dans l'autre sens
+            montee, descente = lie(arrets_dep, des), lie(arrets_arr, ori)
+        if not (montee and descente) or not all(
+                _point_proche_du_trace(a["latitude"], a["longitude"], c["trace"], c["bbox"])
+                for a in (montee, descente)):
+            continue
+        prix = c.get("prix_fcfa") or _prix_ligne({"numero": c.get("numero"), "type": c["type"]})
+        etape = {"mode": c["type"], "numero_ligne": c.get("numero"),
+                 "nom_ligne": f"{c['origine']} ↔ {c['destination']}",
+                 "depart": montee["nom"], "arrivee": descente["nom"], "depart_pos": _pos(montee),
+                 "arrivee_pos": _pos(descente), "duree_minutes": 40, "cout_fcfa": prix,
+                 "distance_m": distance_m(montee["latitude"], montee["longitude"],
+                                          descente["latitude"], descente["longitude"])}
+        fin = _etape_marche(descente["nom"], dest.get("nom", "destination"), descente, dest, descente["distance_m"])
+        debut = _etape_marche(dep.get("nom", "depart"), montee["nom"], dep, montee, montee["distance_m"])
+        sortie.append({"duree_minutes": debut["duree_minutes"] + 40 + fin["duree_minutes"], "cout_fcfa": prix,
+                       "marche_m": montee["distance_m"] + descente["distance_m"], "nb_correspondances": 0,
+                       "etapes": [debut, etape, fin], "arrets_itineraire": []})
+        if len(sortie) >= 5:
+            break
+    return sortie
 
-
-def _ajouter_attente(candidat: dict):
-    total = 0
-    for e in candidat["etapes"]:
-        if e["mode"] != "MARCHE" and "attente_minutes" not in e:
-            e["attente_minutes"] = ATTENTE_MINUTES.get(e["mode"], 5)
-            total += e["attente_minutes"]
-    candidat["duree_minutes"] += total
-
+def _ajouter_conseils_marche(c: dict):
+    """Si une marche dépasse 1 km, on conseille un gbaka / woro-woro / taxi."""
+    for position, e in enumerate(c["etapes"]):
+        if e["mode"] != "MARCHE" or e.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
+            continue
+        km = e["distance_m"] / 1000
+        lignes = _lignes_libres_proches(e["depart_pos"], e["arrivee_pos"])
+        debut = f"L'arrêt est à {km:.1f} km" if position == 0 else f"Il reste {km:.1f} km à parcourir"
+        if lignes:
+            genre = "gbaka" if lignes[0][0] == "GBAKA" else "woro-woro"
+            e["conseil"] = (f"{debut} : prenez plutôt le {genre} « {lignes[0][1]} » qui passe "
+                            + ("près de vous pour le rejoindre." if position == 0 else
+                               "dans ce secteur si vous ne voulez pas marcher.")).replace("prenez plutôt", "prenez plutôt", 1)
+        else:
+            e["conseil"] = f"{debut} : prenez plutôt un woro-woro, un gbaka ou un taxi."
 
 def _lignes_libres_proches(pos_a: dict, pos_b: dict) -> list:
+    """Gbakas / woro-woro dont le tracé passe près des deux points (pour éviter une longue marche)."""
     noms = []
     for c in CATALOGUE:
-        if c["type"] not in ("GBAKA", "WORO_WORO") or c.get("estime"):
-            continue
-        trace, bbox = c.get("trace"), c.get("bbox")
-        if not trace or not bbox:
-            continue
-        if _point_proche_du_trace(pos_a["latitude"], pos_a["longitude"], trace, bbox, 250) and \
-           _point_proche_du_trace(pos_b["latitude"], pos_b["longitude"], trace, bbox, 500):
+        if c["type"] in ("GBAKA", "WORO_WORO") and not c.get("estime") and c.get("trace") and c.get("bbox") \
+                and _point_proche_du_trace(pos_a["latitude"], pos_a["longitude"], c["trace"], c["bbox"], 250) \
+                and _point_proche_du_trace(pos_b["latitude"], pos_b["longitude"], c["trace"], c["bbox"], 500):
             noms.append((c["type"], f"{c['origine']} ↔ {c['destination']}"))
             if len(noms) >= 2:
                 break
     return noms
 
-
-def _ajouter_conseils_marche(candidat: dict):
-    for position, e in enumerate(candidat["etapes"]):
-        if e["mode"] != "MARCHE" or e.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
-            continue
-        au_depart = position == 0
-        km = e["distance_m"] / 1000
-        lignes = _lignes_libres_proches(e["depart_pos"], e["arrivee_pos"])
-        if lignes:
-            ligne = lignes[0]
-            genre = "gbaka" if ligne[0] == "GBAKA" else "woro-woro"
-            if au_depart:
-                e["conseil"] = (f"L'arrêt est à {km:.1f} km : prenez plutôt le {genre} « {ligne[1]} » "
-                                f"qui passe près de vous pour le rejoindre.")
+def conseil_marche_chat(options: list) -> str:
+    """Phrase pour le chat quand une marche est longue (même idée que _ajouter_conseils_marche)."""
+    conseils, vus = [], set()
+    for c in options or []:
+        for e in c.get("etapes", []):
+            cle = (e.get("depart"), e.get("arrivee"))
+            if e.get("mode") != "MARCHE" or e.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M or cle in vus \
+                    or not e.get("depart_pos") or not e.get("arrivee_pos"):
+                continue
+            vus.add(cle)
+            km, lignes = e["distance_m"] / 1000, _lignes_libres_proches(e["depart_pos"], e["arrivee_pos"])
+            if lignes:
+                genre = "gbaka" if lignes[0][0] == "GBAKA" else "woro-woro"
+                conseils.append(f"la marche de {km:.1f} km vers {e['arrivee']} est longue : le {genre} "
+                                f"« {lignes[0][1]} » passe dans ce secteur (prix variable selon le chauffeur)")
             else:
-                e["conseil"] = (f"Il reste {km:.1f} km à parcourir : le {genre} « {ligne[1]} » "
-                                f"dessert ce secteur si vous ne voulez pas marcher.")
-        else:
-            if au_depart:
-                e["conseil"] = (f"L'arrêt est à {km:.1f} km : prenez plutôt un woro-woro, un gbaka "
-                                f"ou un taxi pour le rejoindre.")
-            else:
-                e["conseil"] = (f"Il reste {km:.1f} km à parcourir : prenez un woro-woro, un gbaka "
-                                f"ou un taxi si vous ne voulez pas marcher.")
+                conseils.append(f"la marche de {km:.1f} km vers {e['arrivee']} est longue et je n'ai pas de "
+                                f"gbaka/woro-woro connu sur ce tronçon : prévois de marcher")
+            if len(conseils) >= 2:
+                break
+    return " ; ".join(conseils)
 
-
-def _variante_woro_si_longue_marche(candidat: dict):
-    etapes = candidat.get("etapes", [])
-    if not etapes or etapes[0].get("mode") != "MARCHE":
+def _variante_woro_si_longue_marche(c: dict):
+    """Copie du trajet où la longue marche du début est remplacée par un woro-woro."""
+    etapes = c.get("etapes", [])
+    if not etapes or etapes[0].get("mode") != "MARCHE" or etapes[0].get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
         return None
-    marche = etapes[0]
-    if marche.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
-        return None
-    variante = copy.deepcopy(candidat)
-    marche_remplacee = variante["etapes"].pop(0)
-    duree_woro = max(3, marche_remplacee["distance_m"] // 400)
-    cout_woro = 0
-    wait_woro = ATTENTE_MINUTES.get("WORO_WORO", 3)
-    etape_woro = {
-        "mode": "WORO_WORO", "depart": marche_remplacee["depart"],
-        "arrivee": marche_remplacee["arrivee"],
-        "depart_pos": marche_remplacee["depart_pos"],
-        "arrivee_pos": marche_remplacee["arrivee_pos"],
-        "distance_m": marche_remplacee["distance_m"],
-        "duree_minutes": duree_woro, "cout_fcfa": cout_woro,
-        "attente_minutes": wait_woro,
-    }
-    variante["etapes"].insert(0, etape_woro)
-    variante["duree_minutes"] = (variante["duree_minutes"]
-                                 - marche_remplacee.get("duree_minutes", 0)
-                                 + duree_woro + wait_woro)
-    variante["cout_fcfa"] = variante.get("cout_fcfa", 0) + cout_woro
-    variante["marche_m"] = max(0, variante.get("marche_m", 0) - marche_remplacee["distance_m"])
-    variante["variante"] = "woro_remplace_marche"
-    return variante
-
-
-def _grille_correspondance():
-    if "grille_corr" not in RESEAU:
-        grille = defaultdict(list)
-        for sid, a in RESEAU["arrets"].items():
-            if RESEAU["lignes_par_arret"].get(sid) and sid not in RESEAU["points_libres"]:
-                grille[_cellule(a["latitude"], a["longitude"], 0.003)].append(sid)
-        RESEAU["grille_corr"] = grille
-    return RESEAU["grille_corr"]
-
-
-def _arrets_proches_de(sid: str, rayon_m: float = 300) -> list:
-    a = RESEAU["arrets"].get(sid)
-    if not a:   # identifiant présent dans une ligne mais absent des arrêts (données incomplètes)
-        return []
-    grille = _grille_correspondance()
-    ci, cj = _cellule(a["latitude"], a["longitude"], 0.003)
-    res, n = [], int(rayon_m // 330) + 1
-    for di in range(-n, n + 1):
-        for dj in range(-n, n + 1):
-            for autre in grille.get((ci + di, cj + dj), ()):
-                b = RESEAU["arrets"][autre]
-                d = _dist_rapide(a["latitude"], a["longitude"], b["latitude"], b["longitude"])
-                if d <= rayon_m:
-                    res.append((autre, d))
-    return res
-
-
-def _lignes_voisines() -> dict:
-    if "voisines" not in RESEAU:
-        voisines = defaultdict(set)
-        approx = _rids_approximatifs()
-        for rid, sequences in RESEAU["sequences"].items():
-            if rid in approx or RESEAU["lignes"].get(rid, {}).get("type") == "WORO_WORO":
-                continue
-            for sid in {x for sq in sequences for x in sq if x not in RESEAU["points_libres"]}:
-                for autre, _ in _arrets_proches_de(sid, 300):
-                    for rid2 in RESEAU["lignes_par_arret"].get(autre, []):
-                        if (rid2 != rid and rid2 not in approx
-                                and RESEAU["lignes"].get(rid2, {}).get("type") != "WORO_WORO"):
-                            voisines[rid].add(rid2)
-        RESEAU["voisines"] = voisines
-    return RESEAU["voisines"]
-
-
-def _etape_marche(depart_nom, arrivee_nom, p, q, distance):
-    return {
-        "mode": "MARCHE", "depart": depart_nom, "arrivee": arrivee_nom,
-        "distance_m": int(distance), "duree_minutes": max(1, int(distance) // 80),
-        "cout_fcfa": 0,
-        "depart_pos": {"latitude": p["latitude"], "longitude": p["longitude"]},
-        "arrivee_pos": {"latitude": q["latitude"], "longitude": q["longitude"]},
-    }
-
-
-def _etape_ligne(ligne, rid, ids):
-    m, d = RESEAU["arrets"][ids[0]], RESEAU["arrets"][ids[-1]]
-    return {
-        "mode": ligne["type"], "numero_ligne": ligne.get("numero"),
-        "nom_ligne": ligne.get("nom"),
-        "depart": m["nom"], "arrivee": d["nom"],
-        "depart_pos": {"latitude": m["latitude"], "longitude": m["longitude"]},
-        "arrivee_pos": {"latitude": d["latitude"], "longitude": d["longitude"]},
-        "distance_m": distance_m(m["latitude"], m["longitude"], d["latitude"], d["longitude"]),
-        "duree_minutes": _duree_sur_ligne(ids), "cout_fcfa": _prix_ligne(ligne),
-        "nb_arrets": len(ids) - 1,
-        "arrets": [{"id": a["id"], "nom": a["nom"], "latitude": a["latitude"], "longitude": a["longitude"]}
-                   for a in (RESEAU["arrets"].get(s) for s in ids) if a],
-    }
-
-
-def _assembler(etapes: list, nb_correspondances: int) -> dict:
-    return {
-        "duree_minutes": sum(e["duree_minutes"] for e in etapes),
-        "cout_fcfa": sum(e["cout_fcfa"] for e in etapes),
-        "marche_m": sum(e["distance_m"] for e in etapes if e["mode"] == "MARCHE"),
-        "nb_correspondances": nb_correspondances,
-        "etapes": etapes, "arrets_itineraire": [],
-    }
-
-
-def _arret_nomme(arrets: list, cible: str):
-    for a in arrets:
-        nom = nettoyer_texte(a["nom"])
-        if any(m in nom for m in cible.split() if len(m) > 3) or any(m in cible for m in nom.split() if len(m) > 3):
-            return a
-    return None
-
-
-def _meilleur_transfert(seq_a, apres_a, seq_b, avant_b, rayon=300, ligne_b_bus=False):
-    pos_b = {}
-    for k, sid in enumerate(seq_b):
-        if k <= avant_b and sid not in pos_b:
-            pos_b[sid] = k
-    rayon_max = max(rayon, 800) if ligne_b_bus else rayon
-    meilleur = None
-    for i in range(apres_a + 1, len(seq_a)):
-        sid_a = seq_a[i]
-        if sid_a in RESEAU["points_libres"]:
-            continue
-        for autre, d in _arrets_proches_de(sid_a, rayon_max):
-            k = pos_b.get(autre)
-            if k is None:
-                continue
-            terminus = ligne_b_bus and k == 0
-            if d > rayon and not (terminus and d <= 800):
-                continue
-            score = (i - apres_a) + (avant_b - k) + d / 150.0 - (4 if terminus else 0)
-            if not meilleur or score < meilleur[0]:
-                meilleur = (score, i, k, d, sid_a, autre)
-    if not meilleur:
-        return None
-    _, i, k, d, sid_a, autre = meilleur
-    return (i, k, d, sid_a, autre)
-
-
-def _candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, prix_max_ligne=None) -> list:
-    voisines = _lignes_voisines()
-    perm = lambda rid: RESEAU["lignes"].get(rid, {}).get("type") in modes
-    lignes_dep, lignes_arr = {}, {}
-    for a in arrets_dep:
-        for info in _lignes_passant_par(a["id"], modes):
-            lignes_dep.setdefault(info["rid"], []).append((a, info))
-    for a in arrets_arr:
-        for info in _lignes_passant_par(a["id"], modes):
-            lignes_arr.setdefault(info["rid"], []).append((a, info))
-
-    resultats = {}
-    triples = 0
-    for r1, departs in lignes_dep.items():
-        for r2 in voisines.get(r1, ()):
-            if r2 == r1 or not perm(r2):
-                continue
-            for r3 in voisines.get(r2, ()):
-                if r3 in (r1, r2) or r3 not in lignes_arr:
-                    continue
-                triples += 1
-                if triples > 400:
-                    return list(resultats.values())
-                l1, l2, l3 = RESEAU["lignes"][r1], RESEAU["lignes"][r2], RESEAU["lignes"][r3]
-                if prix_max_ligne and max(_prix_ligne(l1), _prix_ligne(l2), _prix_ligne(l3)) > prix_max_ligne:
-                    continue
-                a_dep, info1 = min(departs, key=lambda x: x[0]["distance_m"])
-                seq1 = info1["sequence"]
-                i_mont = seq1.index(a_dep["id"])
-                for seq2 in RESEAU["sequences"][r2]:
-                    for a_arr, info3 in sorted(lignes_arr[r3], key=lambda x: x[0]["distance_m"])[:3]:
-                        seq3 = info3["sequence"]
-                        k_desc = seq3.index(a_arr["id"])
-                        t1 = _meilleur_transfert(seq1, i_mont, seq2, len(seq2) - 2)
-                        if not t1:
-                            continue
-                        i_d1, j_m2, d12, s_d1, s_m2 = t1
-                        t2 = _meilleur_transfert(seq2, j_m2, seq3, k_desc - 1)
-                        if not t2:
-                            continue
-                        j_d2, k_m3, d23, s_d2, s_m3 = t2
-                        ids1, ids2, ids3 = seq1[i_mont:i_d1 + 1], seq2[j_m2:j_d2 + 1], seq3[k_m3:k_desc + 1]
-                        if len(ids1) < 2 or len(ids2) < 2 or len(ids3) < 2:
-                            continue
-                        A = lambda sid: RESEAU["arrets"][sid]
-                        trop_court = False
-                        for ids in (ids1, ids2, ids3):
-                            if _dist_rapide(A(ids[0])["latitude"], A(ids[0])["longitude"],
-                                            A(ids[-1])["latitude"], A(ids[-1])["longitude"]) < 600:
-                                trop_court = True
-                        if trop_court:
-                            continue
-                        etapes = [
-                            _etape_marche(dep.get("nom", "depart"), A(ids1[0])["nom"],
-                                          dep, A(ids1[0]), a_dep["distance_m"]),
-                            _etape_ligne(l1, r1, ids1),
-                            _etape_marche(A(s_d1)["nom"], A(s_m2)["nom"], A(s_d1), A(s_m2), d12),
-                            _etape_ligne(l2, r2, ids2),
-                            _etape_marche(A(s_d2)["nom"], A(s_m3)["nom"], A(s_d2), A(s_m3), d23),
-                            _etape_ligne(l3, r3, ids3),
-                            _etape_marche(A(ids3[-1])["nom"], dest.get("nom", "destination"),
-                                          A(ids3[-1]), dest, a_arr["distance_m"]),
-                        ]
-                        for e in (etapes[2], etapes[4]):
-                            e["duree_minutes"] = max(2, e["duree_minutes"])
-                        cand = {
-                            "duree_minutes": sum(e["duree_minutes"] for e in etapes),
-                            "cout_fcfa": sum(e["cout_fcfa"] for e in etapes),
-                            "marche_m": sum(e["distance_m"] for e in etapes if e["mode"] == "MARCHE"),
-                            "nb_correspondances": 2,
-                            "etapes": etapes, "arrets_itineraire": [],
-                        }
-                        cle = (r1, r2, r3)
-                        if cle not in resultats or _score_trajet(cand) < _score_trajet(resultats[cle]):
-                            resultats[cle] = cand
-    return list(resultats.values())
-
-
-def _score_trajet(c: dict) -> int:
-    return c["duree_minutes"] + c.get("marche_m", 0) // 160
-
-
-def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
-    out, vus = [], set()
-    for rayon in (1500, 2500, 4000):
-        try:
-            resultats = _construire_candidats_rayon(dep, dest, mode_filtre, prix_max_ligne, rayon)
-        except Exception:   # un rayon qui échoue ne doit pas faire échouer toute la requête
-            log.exception("routage en échec (rayon=%s)", rayon)
-            continue
-        for c in resultats:
-            if _signature_candidat(c) not in vus:
-                vus.add(_signature_candidat(c))
-                out.append(c)
-        if any(_trajet_correct(c) for c in out):   # sinon on élargit au lieu de se contenter d'un trajet qui dépose loin
-            break
-    for c in out:
-        _normaliser_candidat(c)
-    return out
-
-
-DESCENTE_MAX_GBAKA_M = 500
-
+    v = copy.deepcopy(c)
+    m = v["etapes"].pop(0)
+    duree, attente = max(3, m["distance_m"] // 400), ATTENTE_MINUTES["WORO_WORO"]
+    v["etapes"].insert(0, {"mode": "WORO_WORO", "depart": m["depart"], "arrivee": m["arrivee"],
+                           "depart_pos": m["depart_pos"], "arrivee_pos": m["arrivee_pos"],
+                           "distance_m": m["distance_m"], "duree_minutes": duree, "cout_fcfa": 0,
+                           "attente_minutes": attente})
+    v["duree_minutes"] += duree + attente - m.get("duree_minutes", 0)
+    v["marche_m"] = max(0, v.get("marche_m", 0) - m["distance_m"])
+    v["variante"] = "woro_remplace_marche"
+    return v
 
 def _filtrer_trajets_gbaka(candidats: list) -> list:
-    def marche_finale(c):
-        return c["etapes"][-1].get("distance_m", 0) if c["etapes"][-1]["mode"] == "MARCHE" else 0
-
-    def marche_entre(c):
-        return max([e.get("distance_m", 0) for e in c["etapes"][1:-1] if e["mode"] == "MARCHE"] or [0])
-
-    def detour(c):
-        return any(e["mode"] == "GBAKA" and e["duree_minutes"] * 350 > 2.2 * e["distance_m"] + 1500
-                   for e in c["etapes"])
-
+    """Mode gbaka seul : on écarte les trajets avec marche entre deux gbakas > 250 m ou grand détour."""
+    marche_finale = lambda c: c["etapes"][-1].get("distance_m", 0) if c["etapes"][-1]["mode"] == "MARCHE" else 0
+    marche_entre = lambda c: max([e.get("distance_m", 0) for e in c["etapes"][1:-1] if e["mode"] == "MARCHE"] or [0])
+    detour = lambda c: any(e["mode"] == "GBAKA" and e["duree_minutes"] * 350 > 2.2 * e["distance_m"] + 1500
+                           for e in c["etapes"])
     bons = [c for c in candidats if marche_entre(c) <= 250 and not detour(c)]
     if any(marche_finale(c) <= 800 for c in bons):
         bons = [c for c in bons if marche_finale(c) <= 800]
-    bons.sort(key=lambda c: (c["nb_correspondances"], _score_trajet(c)))
-    uniques, vus = [], set()
-    for c in bons:
-        dernier = [e for e in c["etapes"] if e["mode"] != "MARCHE"][-1]
-        cle = tuple((e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
-                     e.get("depart"), e.get("arrivee"))
-                    for e in c["etapes"] if e.get("mode") != "MARCHE")
-        if cle in vus:
-            continue
-        vus.add(cle)
-        uniques.append(c)
-    return uniques
+    return sorted(bons, key=lambda c: (c["nb_correspondances"], _score_trajet(c)))
 
+def _signature(c: dict) -> tuple:
+    """Identité d'un trajet : la suite (ligne, montée, descente) de ses étapes en véhicule."""
+    return tuple((e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"), e.get("depart"), e.get("arrivee"))
+                 for e in c.get("etapes", []) if e.get("mode") != "MARCHE")
 
-#  (descente logique + limits)
-def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
-                                 prix_max_ligne, rayon: int) -> List[dict]:
+def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str, prix_max_ligne,
+                                rayon: int, descente_max: int) -> List[dict]:
+    """Cherche les trajets : on monte à moins de `rayon` m du départ et on descend à moins
+    de `descente_max` m de la destination."""
     if not RESEAU["charge"]:
         charger_reseau_local()
-
-    modes = {"BUS", "GBAKA", "BATEAU"}
-    if mode_filtre == "BUS":
-        modes = {"BUS"}
-    elif mode_filtre == "GBAKA":
-        modes = {"GBAKA"}
-    elif mode_filtre == "BATEAU":
-        modes = {"BATEAU"}
-
-    arrets_dep_proximite = arrets_proximite(dep["latitude"], dep["longitude"], rayon, True, par_nom=False)
-    arrets_dep = _arrets_utiles(arrets_dep_proximite, modes)
-
-    arret_depart_prioritaire = arrets_dep[0] if arrets_dep else None
-    arrets_arr_proximite = arrets_proximite(dest["latitude"], dest["longitude"], rayon, True, par_nom=False)
-    arrets_arr = _arrets_utiles(arrets_arr_proximite, modes)
-
-    lignes_d = {r for a in arrets_dep for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
-    lignes_a = {r for a in arrets_arr for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
-    log.info("[trajets v2] mode=%s rayon=%s arrets_dep=%d arrets_arr=%d lignes_dep=%d lignes_arr=%d en_commun=%d",
-             mode_filtre, rayon, len(arrets_dep), len(arrets_arr), len(lignes_d), len(lignes_a),
-             len(lignes_d & lignes_a))
+    modes = {"BUS", "GBAKA", "BATEAU"} if mode_filtre == "TOUS" else {mode_filtre}
+    # 1) Toutes les lignes qui passent près du départ / près de la destination
+    #    (pour chaque ligne : son arrêt le plus proche).
+    departs = _lignes_proches(dep, rayon, modes)
+    arrivees = _lignes_proches(dest, descente_max, modes)
+    arrets_dep = arrets_proximite(dep["latitude"], dep["longitude"], rayon, tri_par_distance=True)
+    arrets_arr = arrets_proximite(dest["latitude"], dest["longitude"], descente_max, tri_par_distance=True)
+    log.info("[trajets] mode=%s rayon=%s lignes_dep=%d lignes_arr=%d", mode_filtre, rayon, len(departs), len(arrivees))
     if not arrets_dep or not arrets_arr:
         return []
-
-    candidats = []
-    vus = set()
-    meilleur_direct = {}
-
-    # Gbaka / woro-woro : on descend à moins de 500 m de la destination ; si aucun arrêt de gbaka
-    # n'est aussi proche, on prend le plus proche qui existe (+100 m de tolérance).
-    descente_max_gbaka = DESCENTE_MAX_GBAKA_M
-    if modes & {"GBAKA", "WORO_WORO"}:
-        d_min = min((distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
-                     for ar in RESEAU["arrets"].values()
-                     if any(RESEAU["lignes"].get(rid, {}).get("type") == "GBAKA"
-                            for rid in RESEAU["lignes_par_arret"].get(ar["id"], []))), default=0)
-        descente_max_gbaka = max(DESCENTE_MAX_GBAKA_M, int(d_min) + 100)
-
-    # ── DIRECT : descente à l'arrêt de la ligne le plus proche de la destination ──
-    # Boarding always at the stop on the line closest to the user (avoids skipping nearer stops)
-    # Gbaka / woro-woro : on regarde tous les arrêts proches (pas seulement le plus proche),
-    # et pour chaque ligne on monte à SON arrêt le plus proche de l'utilisateur.
-    arrets_dep_direct = arrets_dep
-    sens_deja_pris = set()
-    for a_dep in arrets_dep_direct:
-        for info in _lignes_passant_par(a_dep["id"], modes):
-            ligne = info["ligne"]
-            seq = info["sequence"]
-            if ligne["type"] in ("GBAKA", "WORO_WORO"):
-                cle_sens = (info["rid"], tuple(seq))
-                if cle_sens in sens_deja_pris:
-                    continue
-                sens_deja_pris.add(cle_sens)
-            prix = _prix_ligne(ligne)
-            if prix_max_ligne and prix > prix_max_ligne:
+    # Un gbaka dépose plus près : 500 m (ou le gbaka le plus proche de la destination + 100 m)
+    d_gbaka = min((v[1] for (r, _), v in arrivees.items() if RESEAU["lignes"][r]["type"] == "GBAKA"), default=0)
+    limite_gbaka = min(descente_max, max(DESCENTE_MAX_GBAKA_M, d_gbaka + 100))
+    S = RESEAU["sequences"]
+    prix_ok = lambda rid: not prix_max_ligne or _prix_ligne(RESEAU["lignes"][rid]) <= prix_max_ligne
+    # 2) DIRECT : on monte à l'arrêt de la ligne le plus proche de moi, on descend au plus proche de la destination
+    candidats, meilleur = [], {}
+    for (rid, s), (sid, _, i) in departs.items():
+        fin = _meilleure_descente(S[rid][s], i, dest, descente_max)
+        if fin and prix_ok(rid):
+            c = _assembler(dep, dest, [(rid, S[rid][s][i:fin[0] + 1])])
+            if rid not in meilleur or _score_trajet(c) < _score_trajet(meilleur[rid]):
+                meilleur[rid] = c
+    candidats += meilleur.values()
+    # 3) UNE CORRESPONDANCE : ligne 1 (près du départ) -> ligne 2 (près de la destination)
+    dist_corr = 250 if modes == {"GBAKA"} else 500
+    meilleur = {}
+    premiers, seconds = _garder_par_mode(departs), _garder_par_mode(arrivees)
+    for (r1, s1), (_, _, i1) in premiers:
+        for (r2, s2), (_, _, i2) in seconds:
+            if r1 == r2 or not (prix_ok(r1) and prix_ok(r2)):
                 continue
-
-            montee_sid = a_dep["id"]
-            if montee_sid not in seq:
-                continue
-            montee = RESEAU["arrets"][montee_sid]
-            montee_d = distance_m(dep["latitude"], dep["longitude"],
-                                  montee["latitude"], montee["longitude"])
-            if montee_d > rayon:
-                continue
-            idx_montee = seq.index(montee_sid)
-
-            meilleur_sid, meilleure_d = None, float("inf")
-            # descente : arrêt de la ligne (après la montée) le plus proche de la destination
-            if modes == {"GBAKA"}:
-                for sid in seq[idx_montee + 1:]:
-                    ar = RESEAU["arrets"].get(sid)
-                    if not ar:
-                        continue
-                    d = distance_m(dest["latitude"], dest["longitude"],
-                                   ar["latitude"], ar["longitude"])
-                    if d < meilleure_d:
-                        meilleure_d, meilleur_sid = d, sid
-            for sid in seq[idx_montee + 1:]:
-                if modes == {"GBAKA"} and meilleur_sid is not None:
-                    break
-                ar = RESEAU["arrets"].get(sid)
-                if not ar:
-                    continue
-                d = distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
-                if d < meilleure_d:
-                    meilleure_d, meilleur_sid = d, sid
-            if not meilleur_sid or meilleure_d > rayon:
-                continue
-
-            cle = ("D", info["rid"], montee_sid, meilleur_sid)
-            if cle in vus:
-                continue
-            vus.add(cle)
-
-            descente = RESEAU["arrets"][meilleur_sid]
-            etapes = [_etape_marche(dep.get("nom", "depart"), montee["nom"], dep, montee, montee_d),
-                      _etape_ligne(ligne, info["rid"], seq[idx_montee:seq.index(meilleur_sid) + 1]),
-                      _etape_marche(descente["nom"], dest.get("nom", "destination"), descente, dest, meilleure_d)]
-            nouveau = _assembler(etapes, 0)
-            nouveau["arrets_itineraire"] = etapes[1]["arrets"]
-            ancien = meilleur_direct.get(info["rid"])
-            if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
-                meilleur_direct[info["rid"]] = nouveau
-
-    candidats.extend(meilleur_direct.values())
-
-    # ── 1 CORRESPONDANCE : élargi à 20 arrêts de chaque côté, 25 paires max ──
-    DIST_CORRESPONDANCE_M = 250 if modes == {"GBAKA"} else 500
-    nb_corr = 0
-    meilleur_corr = {}
-
-    # gbaka : arrêts de descente proches de la destination (tous les identifiants, pas un seul par nom)
-    arrets_arr_corr = list(arrets_arr)
-    if modes & {"GBAKA"}:
-        proches_gbaka = []
-        for ar in RESEAU["arrets"].values():
-            d = distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
-            if d > descente_max_gbaka:
-                continue
-            if any(RESEAU["lignes"].get(rid, {}).get("type") == "GBAKA"
-                   for rid in RESEAU["lignes_par_arret"].get(ar["id"], [])):
-                proches_gbaka.append({"id": ar["id"], "nom": ar["nom"], "latitude": ar["latitude"],
-                                      "longitude": ar["longitude"], "distance_m": int(d)})
-        proches_gbaka.sort(key=lambda a: a["distance_m"])
-        ids_gb = {a["id"] for a in proches_gbaka}
-        arrets_arr_corr = proches_gbaka + [a for a in arrets_arr if a["id"] not in ids_gb]
-
-    sens_corr_pris = set()
-    for a_dep in arrets_dep_direct[:40]:
-        if nb_corr >= 25:
-            break
-        for info1 in _lignes_passant_par(a_dep["id"], modes):
-            if nb_corr >= 25:
-                break
-            ligne1 = info1["ligne"]
-            seq1 = info1["sequence"]
-            if ligne1["type"] in ("GBAKA", "WORO_WORO"):
-                cle_sens = (info1["rid"], tuple(seq1))
-                if cle_sens in sens_corr_pris:
-                    continue
-                sens_corr_pris.add(cle_sens)
-            prix1 = _prix_ligne(ligne1)
-
-            montee_sid = a_dep["id"]
-            if montee_sid not in seq1:
-                continue
-            montee1 = RESEAU["arrets"][montee_sid]
-            montee_d = distance_m(dep["latitude"], dep["longitude"],
-                                  montee1["latitude"], montee1["longitude"])
-            if montee_d > rayon:
-                continue
-            idx_montee = seq1.index(montee_sid)
-
-            for a_arr in arrets_arr_corr[:30]:
-                for info2 in _lignes_passant_par(a_arr["id"], modes):
-                    ligne2 = info2["ligne"]
-                    if ligne2["id"] == ligne1["id"]:
-                        continue
-                    seq2 = info2["sequence"]
-                    if a_arr["id"] not in seq2:
-                        continue
-                    idx_arr = seq2.index(a_arr["id"])
-                    t = _meilleur_transfert(seq1, idx_montee, seq2, idx_arr - 1,
-                                            rayon=DIST_CORRESPONDANCE_M,
-                                            ligne_b_bus=(ligne2["type"] == "BUS"))
-                    meilleur_transfert = (t[3], t[4], t[2]) if t else None
-                    if not meilleur_transfert:
-                        continue
-                    sid_d1, sid_m2, dist_corres = meilleur_transfert
-                    ar_d1 = RESEAU["arrets"][sid_d1]
-                    ar_m2 = RESEAU["arrets"][sid_m2]
-                    descente2 = RESEAU["arrets"][a_arr["id"]]
-                    nb1 = seq1.index(sid_d1) - idx_montee
-                    nb2 = idx_arr - seq2.index(sid_m2)
-                    if nb1 < 1 or nb2 < 1:
-                        continue
-                    ids1 = seq1[idx_montee:idx_montee + nb1 + 1]
-                    ids2 = seq2[idx_arr - nb2:idx_arr + 1]
-
-                    cle = ("C", ligne1["id"], ligne2["id"], montee_sid, sid_d1, sid_m2, a_arr["id"])
-                    if cle in vus:
-                        continue
-                    vus.add(cle)
-
-                    etapes = [_etape_marche(dep.get("nom", "depart"), montee1["nom"], dep, montee1, montee_d),
-                              _etape_ligne(ligne1, info1["rid"], ids1),
-                              _etape_marche(ar_d1["nom"], ar_m2["nom"], ar_d1, ar_m2, dist_corres),
-                              _etape_ligne(ligne2, info2["rid"], ids2),
-                              _etape_marche(descente2["nom"], dest.get("nom", "destination"),
-                                            descente2, dest, a_arr["distance_m"])]
-                    etapes[2]["duree_minutes"] = max(2, etapes[2]["duree_minutes"])
-                    nouveau = _assembler(etapes, 1)
-                    paire = (ligne1["id"], ligne2["id"])
-                    ancien = meilleur_corr.get(paire)
-                    if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
-                        meilleur_corr[paire] = nouveau
-                    nb_corr = len(meilleur_corr)
-                    if nb_corr >= 25:
-                        break
-
-    candidats.extend(meilleur_corr.values())
-
-    if not any(_trajet_correct(c) for c in candidats):
-        try:
-            candidats.extend(_candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, prix_max_ligne))
-        except Exception:
-            log.exception("recherche à deux correspondances en échec")
-
+            t = _meilleur_transfert(S[r1][s1], i1, S[r2][s2], i2 - 1, dist_corr,
+                                    RESEAU["lignes"][r2]["type"] == "BUS")
+            if t and t[0] > i1 and i2 > t[1]:
+                c = _assembler(dep, dest, [(r1, S[r1][s1][i1:t[0] + 1]), (r2, S[r2][s2][t[1]:i2 + 1])])
+                if (r1, r2) not in meilleur or _score_trajet(c) < _score_trajet(meilleur[(r1, r2)]):
+                    meilleur[(r1, r2)] = c
+    candidats += list(meilleur.values())[:25]
+    # 4) DEUX CORRESPONDANCES (seulement si le départ est loin des arrêts) puis dernier recours : catalogue
+    if not any(c["etapes"][0].get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M for c in candidats):
+        candidats += _candidats_deux_correspondances(dep, dest, departs, arrivees, prix_max_ligne)
     if not candidats:
-        for c in CATALOGUE:
-            if c["type"] not in modes:
-                continue
-            ori = nettoyer_texte(c.get("origine") or "")
-            des = nettoyer_texte(c.get("destination") or "")
-            if not ori or not des:
-                continue
-            montee, descente = _arret_nomme(arrets_dep, ori), _arret_nomme(arrets_arr, des)
-            if not (montee and descente):
-                montee = _arret_nomme(arrets_dep, des) or montee
-                descente = _arret_nomme(arrets_arr, ori) or descente
-            if not (montee and descente):
-                continue
-            trace = c.get("trace") or []
-            bbox = c.get("bbox")
-            if not trace or not bbox:
-                continue
-            if not _point_proche_du_trace(montee["latitude"], montee["longitude"], trace, bbox):
-                continue
-            if not _point_proche_du_trace(descente["latitude"], descente["longitude"], trace, bbox):
-                continue
-            prix = c.get("prix_fcfa") or _prix_ligne({"numero": c.get("numero"), "type": c["type"]})
-            etape = {
-                "mode": c["type"], "numero_ligne": c.get("numero"),
-                "nom_ligne": f"{c['origine']} ↔ {c['destination']}",
-                "depart": montee["nom"], "arrivee": descente["nom"],
-                "depart_pos": {"latitude": montee["latitude"], "longitude": montee["longitude"]},
-                "arrivee_pos": {"latitude": descente["latitude"], "longitude": descente["longitude"]},
-                "distance_m": distance_m(montee["latitude"], montee["longitude"],
-                                          descente["latitude"], descente["longitude"]),
-                "duree_minutes": 40, "cout_fcfa": prix,
-            }
-            candidats.append(_assembler([
-                _etape_marche(dep.get("nom", "depart"), montee["nom"], dep, montee, montee["distance_m"]),
-                etape,
-                _etape_marche(descente["nom"], dest.get("nom", "destination"), descente, dest,
-                              descente["distance_m"])], 0))
-            if len(candidats) >= 5:
-                break
-
-    # Gbaka / woro-woro : on descend à moins de 500 m de la destination (sinon autre gbaka / correspondance)
-    if modes & {"GBAKA", "WORO_WORO"}:
-        def _descente_trop_loin(c):
-            transports = [e for e in c["etapes"] if e["mode"] != "MARCHE"]
-            fin = c["etapes"][-1]
-            return bool(transports) and transports[-1]["mode"] in ("GBAKA", "WORO_WORO") \
-                and fin["mode"] == "MARCHE" and fin.get("distance_m", 0) > descente_max_gbaka
-        candidats = [c for c in candidats if not _descente_trop_loin(c)]
-
+        candidats = _candidats_depuis_catalogue(dep, dest, modes, arrets_dep, arrets_arr)
+    # 5) Nettoyage : descente trop loin pour un gbaka, attente, variantes woro-woro
+    def descente_trop_loin(c):
+        tr = [e for e in c["etapes"] if e["mode"] != "MARCHE"]
+        return bool(tr) and tr[-1]["mode"] in ("GBAKA", "WORO_WORO") and c["etapes"][-1]["mode"] == "MARCHE" \
+            and c["etapes"][-1].get("distance_m", 0) > limite_gbaka
+    candidats = [c for c in candidats if not descente_trop_loin(c)]
+    if departs:                                        # on ne propose pas de monter beaucoup plus loin que l'arrêt le plus proche
+        limite_montee = max(600, 3 * min(v[1] for v in departs.values()))
+        proches = [c for c in candidats if c["etapes"][0].get("distance_m", 0) <= limite_montee]
+        candidats = proches or candidats
     if modes == {"GBAKA"}:
         candidats = _filtrer_trajets_gbaka(candidats)
     for c in candidats:
-        _ajouter_attente(c)
-
-    variantes_woro = []
-    for c in list(candidats):
-        if arret_depart_prioritaire:
-            premier_transport = next(
-                (e for e in c.get("etapes", []) if e.get("mode") != "MARCHE"),
-                None,
-            )
-            if not premier_transport:
-                continue
-            depart_pos = premier_transport.get("depart_pos") or {}
-            if depart_pos.get("latitude") is None or depart_pos.get("longitude") is None:
-                continue
-            if distance_m(
-                arret_depart_prioritaire["latitude"],
-                arret_depart_prioritaire["longitude"],
-                depart_pos.get("latitude"),
-                depart_pos.get("longitude"),
-            ) > 100:
+        for e in c["etapes"]:
+            if e["mode"] != "MARCHE" and "attente_minutes" not in e:
+                e["attente_minutes"] = ATTENTE_MINUTES.get(e["mode"], 5)
+                c["duree_minutes"] += e["attente_minutes"]
+    plus_proche = min(departs.items(), key=lambda kv: kv[1][1])[1][0] if departs else None
+    for c in list(candidats):                          # variante : woro-woro au lieu de la longue marche
+        tr = _etapes_transport(c)
+        if plus_proche and tr and (tr[0].get("depart_pos") or {}).get("latitude") is not None:
+            a = RESEAU["arrets"][plus_proche]
+            if distance_m(a["latitude"], a["longitude"], tr[0]["depart_pos"]["latitude"],
+                          tr[0]["depart_pos"]["longitude"]) > 100:
                 continue
         v = _variante_woro_si_longue_marche(c)
         if v:
-            variantes_woro.append(v)
-    candidats.extend(variantes_woro)
-
+            candidats.append(v)
+    # 6) Tri : (a) moins de correspondances/vite, (b) en pénalisant la longue marche ; on mélange les deux listes
     par_vehicules = sorted(candidats, key=lambda c: (c["nb_correspondances"], _score_trajet(c), c["cout_fcfa"]))
     par_marche = sorted(candidats, key=lambda c: (
         c["nb_correspondances"] + (1 if c["etapes"][0].get("distance_m", 0) > SEUIL_MARCHE_LONGUE_M else 0),
         _score_trajet(c), c["cout_fcfa"]))
-    candidats = []
-    for a, b in zip(par_vehicules, par_marche):
-        candidats.append(a)
-        candidats.append(b)
-    uniques, vus_trajets = [], set()
-    for c in candidats:
-        signature = tuple((e.get("numero_ligne") or e.get("nom_ligne"), e["depart"], e["arrivee"])
-                          for e in c["etapes"] if e["mode"] != "MARCHE")
-        if signature in vus_trajets:
-            continue
-        vus_trajets.add(signature)
-        uniques.append(c)
+    uniques, vus = [], set()
+    for c in [x for paire in zip(par_vehicules, par_marche) for x in paire]:
+        sig = tuple((e.get("numero_ligne") or e.get("nom_ligne"), e["depart"], e["arrivee"])
+                    for e in c["etapes"] if e["mode"] != "MARCHE")
+        if sig not in vus:
+            vus.add(sig)
+            uniques.append(c)
     candidats = uniques[:10]
-    for c in candidats:
+    for c in candidats:                                # on enlève les marches de correspondance < 30 m
+        n = len(c["etapes"])
         c["etapes"] = [e for i, e in enumerate(c["etapes"])
-                       if not (e["mode"] == "MARCHE" and 0 < i < len(c["etapes"]) - 1
-                               and e.get("distance_m", 0) < 30)]
-    for c in candidats:
+                       if not (e["mode"] == "MARCHE" and 0 < i < n - 1 and e.get("distance_m", 0) < 30)]
         _ajouter_conseils_marche(c)
     return candidats
 
+def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
+    """Point d'entrée : on cherche d'abord un trajet qui dépose à ≤ 1000 m de la destination ;
+    si rien, on élargit la zone de départ, et en tout dernier recours la distance de descente."""
+    for rayon, descente in ((RAYON_DEPART_M, DESCENTE_MAX_M), (2500, DESCENTE_MAX_M),
+                            (4000, DESCENTE_MAX_M), (4000, 2 * DESCENTE_MAX_M)):
+        resultats = _construire_candidats_rayon(dep, dest, mode_filtre, prix_max_ligne, rayon, descente)
+        if resultats:
+            for c in resultats:
+                _normaliser_candidat(c)
+            return resultats
+    return []
 
 def trajets_par_mode(dep: dict, dest: dict, prix_max_ligne=None) -> dict:
-    return {
-        "bus":     construire_candidats(dep, dest, "BUS", prix_max_ligne)[:5],
-        "gbakas":  construire_candidats(dep, dest, "GBAKA", prix_max_ligne)[:5],
-        "bateaux": construire_candidats(dep, dest, "BATEAU", prix_max_ligne)[:5],
-    }
+    """Les meilleurs trajets séparés par mode (pour l'écran « explorer »)."""
+    return {"bus": construire_candidats(dep, dest, "BUS", prix_max_ligne)[:5],
+            "gbakas": construire_candidats(dep, dest, "GBAKA", prix_max_ligne)[:5],
+            "bateaux": construire_candidats(dep, dest, "BATEAU", prix_max_ligne)[:5]}
+
+def candidats_multimodaux(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> list:
+    """Mode imposé -> uniquement ce mode (sinon trajets qui le COMBINENT avec un autre).
+    Mode TOUS -> bus + gbaka + bateau-bus + trajets mixtes."""
+    if mode_filtre in ("BUS", "GBAKA", "BATEAU"):
+        autorises = {"BUS": {"BUS"}, "GBAKA": {"GBAKA", "WORO_WORO"}, "BATEAU": {"BATEAU"}}[mode_filtre]
+        modes_de = lambda c: {e["mode"] for e in c.get("etapes", []) if e["mode"] != "MARCHE"}
+        purs = [c for c in construire_candidats(dep, dest, mode_filtre, prix_max_ligne) if modes_de(c) <= autorises]
+        if not purs:                                   # aucun trajet 100 % dans ce mode : trajets qui le combinent
+            purs = [c for c in construire_candidats(dep, dest, "TOUS", prix_max_ligne)
+                    if modes_de(c) & autorises and not modes_de(c) <= autorises]
+            for c in purs:
+                c["combo_mode"] = mode_filtre
+        for c in purs:
+            _ajouter_textes(c)
+        return purs
+    par_mode = trajets_par_mode(dep, dest, prix_max_ligne)
+    sortie, vus = [], set()
+    for groupe in (construire_candidats(dep, dest, "TOUS", prix_max_ligne),
+                   par_mode["bus"], par_mode["gbakas"], par_mode["bateaux"]):
+        for c in groupe:
+            if _signature(c) not in vus:
+                vus.add(_signature(c))
+                _ajouter_textes(c)
+                sortie.append(c)
+    return sortie
+
+def arrets_proches_trajet(dep: dict, dest: dict, mode_filtre: str = "TOUS", rayon_m: int = 3000) -> dict:
+    """Les 5 arrêts les plus proches du départ et de la destination (pour l'écran carte)."""
+    modes = None if mode_filtre == "TOUS" else [mode_filtre]
+    return {"depart": arrets_proximite_par_modes(dep["latitude"], dep["longitude"], rayon_m, modes)[:5],
+            "arrivee": arrets_proximite_par_modes(dest["latitude"], dest["longitude"], rayon_m, modes)[:5]}
 
 
-def passages_gbaka_pres_de(lat: float, lon: float, rayon_m: int = 800) -> List[dict]:
-    if not RESEAU["charge"]:
-        charger_reseau_local()
-    resultats = []
-    for rid, sequences in RESEAU["sequences"].items():
-        ligne = RESEAU["lignes"].get(rid)
-        if not ligne or ligne["type"] not in ("GBAKA", "WORO_WORO"):
-            continue
-        for idx_sens, seq in enumerate(sequences):
-            sens_label = "aller" if idx_sens == 0 else "retour"
-            for sid in seq:
-                arret = RESEAU["arrets"].get(sid)
-                if not arret:
-                    continue
-                d = distance_m(lat, lon, arret["latitude"], arret["longitude"])
-                if d <= rayon_m:
-                    resultats.append({
-                        "arret_id": sid, "arret_nom": arret["nom"],
-                        "latitude": arret["latitude"], "longitude": arret["longitude"],
-                        "distance_m": int(d),
-                        "ligne_id": rid, "ligne_nom": ligne.get("nom"),
-                        "type": ligne["type"], "sens": sens_label,
-                        "terminus": seq[-1] if idx_sens == 0 else seq[-1],
-                        "nb_arrets_total": len(seq),
-                    })
-    resultats.sort(key=lambda x: x["distance_m"])
-    return resultats
-
-
-# frontend 
-
+# ── 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche) ──
 def prix_connu(mode, nom_ligne, montee, descente, numero):
     if numero and str(numero) in PRIX_LIGNES:
         return PRIX_LIGNES[str(numero)]
     return PRIX_POUR_CLASSEMENT.get(mode, 250)
 
-
 def normaliser_reseau(reseau: str, type_ligne: str) -> str:
+    """Nom propre du réseau (Monbus, Wibus, Monbato...), « Autre » si inconnu."""
     r = nettoyer_texte(reseau or "")
-    if type_ligne == "BATEAU":
-        if "monbato" in r:
-            return "Monbato"
-        if "stl" in r:
-            return "STL"
-        if "aqua" in r:
-            return "Aqualines"
-        return "Autre"
-    if type_ligne == "BUS":
-        if "express" in r:
-            return "Express"
-        if "wibus" in r:
-            return "Wibus"
-        if "navette" in r:
-            return "Navette"
-        if "monbus" in r or "mon bus" in r:
-            return "Monbus"
-        return "Autre"
-    if type_ligne == "GBAKA":
-        if "adja" in r:
-            return "Adjamé"
-        if "abobo" in r:
-            return "Abobo"
-        return "Autre"
+    mots = {"BATEAU": (("monbato", "Monbato"), ("stl", "STL"), ("aqua", "Aqualines")),
+            "BUS": (("express", "Express"), ("wibus", "Wibus"), ("navette", "Navette"),
+                    ("monbus", "Monbus"), ("mon bus", "Monbus")),
+            "GBAKA": (("adja", "Adjamé"), ("abobo", "Abobo"))}
+    for cle, nom in mots.get(type_ligne, ()):
+        if cle in r:
+            return nom
     return "Autre"
 
-
 def lignes_du_catalogue(type_ligne=None) -> list:
+    """Liste des lignes du catalogue, au format attendu par l'application."""
     resultat = []
     for i, c in enumerate(CATALOGUE):
         if type_ligne and c["type"] != type_ligne:
             continue
         numero = c["numero"]
-        if c["type"] == "BUS" and numero and str(numero).isdigit():
-            n = int(numero)
-            if 1 <= n <= 9:
-                numero = f"{n:02d}"
-        if c["type"] == "GBAKA":
-            ori = nettoyer_texte(c.get("origine") or "")
-            if "adja" in ori:
-                reseau = "Adjamé"
-            elif "abobo" in ori:
-                reseau = "Abobo"
-            else:
-                reseau = normaliser_reseau(c.get("reseau"), "GBAKA")
-        else:
-            reseau = normaliser_reseau(c.get("reseau"), c["type"])
-        resultat.append({
-            "id": f"cat:{i}", "numero": numero or None,
-            "origine": c["origine"], "destination": c["destination"],
-            "nom": f"{c['origine']} ↔ {c['destination']}",
-            "operateur": c["operateur"], "reseau": reseau, "type": c["type"],
-            "prix_fcfa": c.get("prix_fcfa") or prix_connu(c["type"], None, "", "", c["numero"]),
-        })
+        if c["type"] == "BUS" and numero and str(numero).isdigit() and 1 <= int(numero) <= 9:
+            numero = f"{int(numero):02d}"                  # 5 -> « 05 »
+        ori = nettoyer_texte(c.get("origine") or "")
+        reseau = normaliser_reseau("adja" if c["type"] == "GBAKA" and "adja" in ori else
+                                   "abobo" if c["type"] == "GBAKA" and "abobo" in ori else c.get("reseau"),
+                                   c["type"])
+        resultat.append({"id": f"cat:{i}", "numero": numero or None, "origine": c["origine"],
+                         "destination": c["destination"], "nom": f"{c['origine']} ↔ {c['destination']}",
+                         "operateur": c["operateur"], "reseau": reseau, "type": c["type"],
+                         "prix_fcfa": c.get("prix_fcfa") or prix_connu(c["type"], None, "", "", c["numero"])})
     return resultat
-
 
 def liste_lignes(type_transport=None) -> list:
     return lignes_du_catalogue(type_transport)
 
-
 def lignes_pour_app(type_transport=None, q=None, zone=None, reseau=None) -> dict:
-    genre = None
-    if type_transport:
-        t = type_transport.strip().upper()
-        if t in ("BUS", "GBAKA", "BATEAU", "WORO_WORO"):
-            genre = t
+    """Écran « Explorer » : lignes filtrées par type, réseau et mot-clé, avec les compteurs."""
+    t = (type_transport or "").strip().upper()
+    genre = t if t in ("BUS", "GBAKA", "BATEAU", "WORO_WORO") else None
     toutes = lignes_du_catalogue(genre)
-    comptes = Counter(l["reseau"] for l in toutes)
     filtres = [{"nom": "Toutes", "valeur": "toutes", "total": len(toutes)}]
-    for nom, total in comptes.most_common():
-        filtres.append({"nom": nom, "valeur": nom.lower(), "total": total})
+    filtres += [{"nom": n, "valeur": n.lower(), "total": t2}
+                for n, t2 in Counter(l["reseau"] for l in toutes).most_common()]
     choisies = toutes
     if reseau and reseau.lower() not in ("toutes", "tous", ""):
-        reseau_clean = nettoyer_texte(reseau)
-        choisies = [l for l in choisies if nettoyer_texte(l["reseau"]) == reseau_clean]
+        choisies = [l for l in choisies if nettoyer_texte(l["reseau"]) == nettoyer_texte(reseau)]
     if q:
         mots = extraire_mots(q)
         choisies = [l for l in choisies if all(
-            m in nettoyer_texte(f"{l.get('numero') or ''} {l['origine']} {l['destination']}")
-            for m in mots)]
+            m in nettoyer_texte(f"{l.get('numero') or ''} {l['origine']} {l['destination']}") for m in mots)]
     for l in choisies:
         if l["type"] in ("GBAKA", "WORO_WORO"):
             l["sens"] = _arrets_ligne_pour_api(l["id"])
-    return {"type": genre, "reseau": reseau or "toutes",
-            "total": len(choisies), "total_type": len(toutes),
-            "filtres": filtres, "lignes": choisies}
-
+    return {"type": genre, "reseau": reseau or "toutes", "total": len(choisies),
+            "total_type": len(toutes), "filtres": filtres, "lignes": choisies}
 
 def _mots_cle(texte: str) -> list:
     return [m for m in nettoyer_texte(texte or "").split()
             if len(m) > 2 and m not in ("terminus", "gare", "arret")]
 
-
 def _score_nom(cible: str, nom: str) -> float:
-    import difflib
+    """Ressemblance entre deux noms de lieux (0 à 1), tolère les petites fautes."""
     mots_c, mots_n = _mots_cle(cible), _mots_cle(nom)
     if not mots_c:
         return 0.0
-    ok = 0
-    for mc in mots_c:
-        for mn in mots_n:
-            if mc == mn or (len(mc) >= 5 and len(mn) >= 5
-                            and (mc.startswith(mn[:5]) or mn.startswith(mc[:5]))) \
-               or difflib.SequenceMatcher(None, mc, mn).ratio() >= 0.82:
-                ok += 1
-                break
+    ok = sum(1 for mc in mots_c if any(
+        mc == mn or (len(mc) >= 5 and len(mn) >= 5 and (mc.startswith(mn[:5]) or mn.startswith(mc[:5])))
+        or difflib.SequenceMatcher(None, mc, mn).ratio() >= 0.82 for mn in mots_n))
     return ok / len(mots_c)
 
-
-#  _sens_ligne_bus — corrige le bug 85
 def _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero) -> list:
-    """Aller / retour d'une ligne BUS/BATEAU.
-    PRIORITÉ au cat:{index} (séquence propre au CSV : deux lignes partageant
-    un même numéro — ex. 85 Phalène/Gare Campus et 85 Gare Kouté/Gare Campus —
-    ne doivent JAMAIS hériter des arrêts de l'autre).
-    Fallback GTFS uniquement si le catalogue n'a pas de séquence, avec filtre
-    supplémentaire par nom de ligne pour éviter les confusions."""
+    """Aller / retour d'une ligne BUS ou BATEAU (les arrêts affichés dans l'écran détail).
+    On prend d'abord les arrêts propres à la ligne du CSV (cat:N) pour ne jamais mélanger
+    deux lignes qui ont le même numéro ; sinon on se rabat sur le GTFS."""
     rid_cat = f"cat:{index_catalogue}" if index_catalogue is not None else None
-
+    S, L, A = RESEAU["sequences"], RESEAU["lignes"], RESEAU["arrets"]
+    gtfs = [rid for rid, i in L.items() if not rid.startswith("cat:") and i.get("type") == fiche["type"]]
     candidates = []
-    # La ligne 610 possède une trace catalogue en boucle qui mélange les deux
-    # sens. Ses séquences GTFS décrivent correctement Adjamé Liberté ↔ Bingerville.
-    if str(numero).strip() == "610":
-        for rid, info in RESEAU["lignes"].items():
-            if (rid.startswith("cat:") or info.get("type") != fiche["type"]
-                    or str(info.get("numero") or "").strip() != "610"):
-                continue
-            candidates.extend(RESEAU["sequences"].get(rid, []))
-
-    # 1) Séquences propres au catalogue (garanti : bonne ligne)
-    if not candidates and rid_cat and RESEAU["sequences"].get(rid_cat):
-        candidates.extend(RESEAU["sequences"][rid_cat])
-
-    # 2) Fallback GTFS si et seulement si le catalogue n'a rien
-    if not candidates and numero:
-        variantes = {numero}
-        if numero.isdigit():
-            variantes |= {str(int(numero)), f"{int(numero):02d}"}
-        for rid, info in RESEAU["lignes"].items():
-            if info.get("type") != fiche["type"] or rid.startswith("cat:"):
-                continue
-            num = str(info.get("numero") or "").strip()
-            if num not in variantes and not (num.isdigit() and numero.isdigit()
-                                              and int(num) == int(numero)):
-                continue
-            nom_ligne = nettoyer_texte(info.get("nom") or "")
-            if _score_nom(origine, nom_ligne) < 0.5 and _score_nom(destination, nom_ligne) < 0.5:
-                continue
-            for seq in RESEAU["sequences"].get(rid, []):
-                candidates.append(seq)
-
-    if not candidates and numero:
-        # dernier recours : une seule ligne GTFS portant ce numéro -> on la prend
-        rids = [rid for rid, info in RESEAU["lignes"].items()
-                if info.get("type") == fiche["type"] and not rid.startswith("cat:")
-                and str(info.get("numero") or "").strip() == str(numero).strip()]
+    if str(numero).strip() == "610":                   # la 610 : le GTFS est plus fiable que le tracé en boucle
+        for rid in gtfs:
+            if str(L[rid].get("numero") or "").strip() == "610":
+                candidates += S.get(rid, [])
+    if not candidates and rid_cat and S.get(rid_cat):
+        candidates += S[rid_cat]
+    if not candidates and numero:                      # repli GTFS : même numéro + nom de ligne qui ressemble
+        variantes = {numero} | ({str(int(numero)), f"{int(numero):02d}"} if numero.isdigit() else set())
+        for rid in gtfs:
+            num = str(L[rid].get("numero") or "").strip()
+            if num in variantes or (num.isdigit() and numero.isdigit() and int(num) == int(numero)):
+                nom_l = nettoyer_texte(L[rid].get("nom") or "")
+                if _score_nom(origine, nom_l) >= 0.5 or _score_nom(destination, nom_l) >= 0.5:
+                    candidates += S.get(rid, [])
+    if not candidates and numero:                      # dernier recours : une seule ligne GTFS avec ce numéro
+        rids = [r for r in gtfs if str(L[r].get("numero") or "").strip() == str(numero).strip()]
         if len(rids) == 1:
-            candidates.extend(RESEAU["sequences"].get(rids[0], []))
-
+            candidates += S.get(rids[0], [])
     if not candidates:
         return []
+    dist_ids = lambda x, y: distance_m(A[x]["latitude"], A[x]["longitude"], A[y]["latitude"], A[y]["longitude"])
 
-    def nettoyee(seq):
+    def nettoyee(seq):                                 # enlève les arrêts répétés de même nom
         out, prec = [], None
         for sid in seq:
-            a = RESEAU["arrets"].get(sid)
-            if not a:
-                continue
-            cle = nettoyer_texte(a["nom"])
-            if cle == prec:
-                continue
-            prec = cle
-            out.append(sid)
+            if sid in A and nettoyer_texte(A[sid]["nom"]) != prec:
+                prec = nettoyer_texte(A[sid]["nom"])
+                out.append(sid)
         return out
 
-    def pos(sid):
-        a = RESEAU["arrets"][sid]
-        return a["latitude"], a["longitude"]
-
-    def dist_ids(x, y):
-        return distance_m(*pos(x), *pos(y))
-
-    def moitie_aller_retour(seq):
-        """Une séquence qui revient à son point de départ contient l'aller ET le retour :
-        on la coupe au point de rebroussement (arrêt le plus éloigné du départ)."""
+    def moities(seq):                                  # une boucle contient l'aller ET le retour : on la coupe
         if len(seq) < 6 or dist_ids(seq[0], seq[-1]) > 500:
             return [seq]
-        eloignement = [dist_ids(seq[0], sid) for sid in seq]
-        m = max(range(len(seq)), key=lambda i: eloignement[i])
-        # autour du point de rebroussement, on préfère l'arrêt qui porte le nom de la destination
-        fenetre = range(max(1, m - 3), min(len(seq) - 1, m + 3) + 1)
-        m = max(fenetre, key=lambda i: (_score_nom(destination, RESEAU["arrets"][seq[i]]["nom"]),
-                                         eloignement[i]))
-        if m < 2 or len(seq) - m < 3:
-            return [seq]
-        return [seq[:m + 1], seq[m:]]
-
+        loin = [dist_ids(seq[0], s) for s in seq]
+        m = max(range(len(seq)), key=lambda i: loin[i])
+        m = max(range(max(1, m - 3), min(len(seq) - 1, m + 3) + 1),
+                key=lambda i: (_score_nom(destination, A[seq[i]]["nom"]), loin[i]))
+        return [seq] if m < 2 or len(seq) - m < 3 else [seq[:m + 1], seq[m:]]
     cands = []
     for sq in candidates:
-        for moitie in moitie_aller_retour(nettoyee(sq)):
-            if len(moitie) >= 2 and moitie not in cands:
-                cands.append(moitie)
+        for m in moities(nettoyee(sq)):
+            if len(m) >= 2 and m not in cands:
+                cands.append(m)
     if not cands:
         return []
 
-    # points de repère : arrêts qui portent le nom de l'origine / de la destination du catalogue
-    def repere(nom):
+    def repere(nom):                                   # l'arrêt qui porte le nom de l'origine / destination
         meilleur, sc = None, 0.5
         for sq in cands:
             for sid in sq:
-                v = _score_nom(nom, RESEAU["arrets"][sid]["nom"])
-                if v > sc or (v == sc and meilleur is None and v >= 0.5):
+                v = _score_nom(nom, A[sid]["nom"])
+                if v > sc or (v == sc and meilleur is None):
                     meilleur, sc = sid, v
         return meilleur
+    rep_o, rep_d = repere(origine), repere(destination)
 
-    rep_ori, rep_dest = repere(origine), repere(destination)
-
-    def ecart(seq, ori, dest, rep_o, rep_d):
-        e = 0.0
-        if rep_o:
-            e += dist_ids(seq[0], rep_o)
-        if rep_d:
-            e += dist_ids(seq[-1], rep_d)
-        return e
-
-    def cle_sens(seq, ori, dest, rep_o, rep_d):
-        sc = _score_nom(ori, RESEAU["arrets"][seq[0]]["nom"]) + _score_nom(dest, RESEAU["arrets"][seq[-1]]["nom"])
-        return (round(sc, 2), -ecart(seq, ori, dest, rep_o, rep_d), len(seq))
-
-    aller = max(cands, key=lambda c: cle_sens(c, origine, destination, rep_ori, rep_dest))
-    if str(numero).strip() == "610":
+    def cle_sens(seq):
+        sc = _score_nom(origine, A[seq[0]]["nom"]) + _score_nom(destination, A[seq[-1]]["nom"])
+        ecart = (dist_ids(seq[0], rep_o) if rep_o else 0) + (dist_ids(seq[-1], rep_d) if rep_d else 0)
+        return (round(sc, 2), -ecart, len(seq))
+    aller = max(cands, key=cle_sens)
+    ecart_retour = lambda c: dist_ids(c[0], aller[-1]) + dist_ids(c[-1], aller[0])
+    autres = [c for c in cands if c != aller]
+    retour = min(autres, key=ecart_retour) if autres and str(numero).strip() != "610" else None
+    if retour is None or ecart_retour(retour) > 1500 \
+            or [A[x]["nom"] for x in retour] == [A[x]["nom"] for x in aller]:
         retour = list(reversed(aller))
-    else:
-        # retour = séquence qui part de l'arrivée de l'aller et revient à son départ
-        def ecart_retour(c):
-            return dist_ids(c[0], aller[-1]) + dist_ids(c[-1], aller[0])
-        autres = [c for c in cands if c != aller]
-        retour = min(autres, key=ecart_retour) if autres else None
-        if retour is None or ecart_retour(retour) > 1500 \
-                or [RESEAU["arrets"][x]["nom"] for x in retour] == [RESEAU["arrets"][x]["nom"] for x in aller]:
-            retour = list(reversed(aller))
 
     def fabrique(seq, label, direction, nom_depart, nom_terminus):
-        arrets = []
-        for sid in seq:
-            a = RESEAU["arrets"][sid]
-            arrets.append({"id": a["id"], "nom": a["nom"],
-                           "latitude": a["latitude"], "longitude": a["longitude"],
-                           "role": "arret"})
+        arrets = [{"id": A[s]["id"], "nom": A[s]["nom"], "latitude": A[s]["latitude"],
+                   "longitude": A[s]["longitude"], "role": "arret"} for s in seq]
         arrets[0]["role"], arrets[-1]["role"] = "depart", "arrivee"
-        # le départ / terminus affichés dans la liste = ceux affichés en haut de la fiche
-        if nom_depart:
-            arrets[0]["nom"] = nom_depart
-        if nom_terminus:
-            arrets[-1]["nom"] = nom_terminus
-        return {"direction": direction, "sens": label,
-                "titre": f"{arrets[0]['nom']} → {arrets[-1]['nom']}",
-                "depart": arrets[0]["nom"], "terminus": arrets[-1]["nom"],
-                "nb_arrets": len(arrets), "arrets": arrets, "trace": []}
-
+        arrets[0]["nom"], arrets[-1]["nom"] = nom_depart or arrets[0]["nom"], nom_terminus or arrets[-1]["nom"]
+        return {"direction": direction, "sens": label, "titre": f"{arrets[0]['nom']} → {arrets[-1]['nom']}",
+                "depart": arrets[0]["nom"], "terminus": arrets[-1]["nom"], "nb_arrets": len(arrets),
+                "arrets": arrets, "trace": []}
     return [fabrique(aller, "aller", "A", origine, destination),
             fabrique(retour, "retour", "R", destination, origine)]
 
-
 def detail_ligne(ident: str):
+    """Écran « détail d'une ligne » : infos + arrêts de l'aller et du retour."""
     if not RESEAU["charge"]:
         charger_reseau_local()
-
-    fiche = None
-    index_catalogue = None
-
-    if ident.startswith("cat:") and ident[4:].isdigit():
-        i = int(ident[4:])
-        if 0 <= i < len(CATALOGUE):
-            fiche = CATALOGUE[i]
-            index_catalogue = i
-    if not fiche:
-        for i, c in enumerate(CATALOGUE):
-            if str(c.get("numero") or "") == str(ident):
-                fiche = c
-                index_catalogue = i
-                break
-    if not fiche:
+    index = int(ident[4:]) if ident.startswith("cat:") and ident[4:].isdigit() and int(ident[4:]) < len(CATALOGUE) \
+        else next((i for i, c in enumerate(CATALOGUE) if str(c.get("numero") or "") == str(ident)), None)
+    if index is None:
         return None
-
-    origine = (fiche.get("origine") or "").strip()
-    destination = (fiche.get("destination") or "").strip()
+    fiche = CATALOGUE[index]
+    origine, destination = (fiche.get("origine") or "").strip(), (fiche.get("destination") or "").strip()
     numero = str(fiche.get("numero") or "").strip()
-
-    resultat = {
-        "id": ident if ident.startswith("cat:") else f"cat:{index_catalogue}",
-        "numero": numero or None, "type": fiche["type"],
-        "operateur": fiche.get("operateur"),
-        "reseau": normaliser_reseau(fiche.get("reseau"), fiche["type"]),
-        "nom": f"{origine} ↔ {destination}",
-        "depart": origine, "arrivee": destination,
-        "prix_fcfa": fiche.get("prix_fcfa") or prix_connu(fiche["type"], None, "", "", numero),
-        "nb_arrets": None, "sens": [],
-    }
-
+    res = {"id": f"cat:{index}", "numero": numero or None, "type": fiche["type"],
+           "operateur": fiche.get("operateur"), "reseau": normaliser_reseau(fiche.get("reseau"), fiche["type"]),
+           "nom": f"{origine} ↔ {destination}", "depart": origine, "arrivee": destination,
+           "prix_fcfa": fiche.get("prix_fcfa") or prix_connu(fiche["type"], None, "", "", numero),
+           "nb_arrets": None, "sens": []}
     if fiche["type"] in ("GBAKA", "WORO_WORO"):
-        sens_csv = _arrets_ligne_pour_api(f"cat:{index_catalogue}")
+        sens_csv = _arrets_ligne_pour_api(f"cat:{index}")
         if sens_csv:
-            resultat["nb_arrets"] = max(s["nb_arrets"] for s in sens_csv)
+            res["nb_arrets"] = max(s["nb_arrets"] for s in sens_csv)
             for s in sens_csv:
                 arrets = [dict(a) for a in s["arrets"]]
-                if arrets:
-                    arrets[0]["role"] = "depart"
-                    arrets[-1]["role"] = "arrivee"
-                resultat["sens"].append({
-                    "direction": "A" if s["sens"] == "aller" else "R",
-                    "sens": s["sens"],
-                    "titre": f"{s['depart']} → {s['arrivee']}",
-                    "depart": s["depart"], "terminus": s["arrivee"],
-                    "nb_arrets": s["nb_arrets"], "arrets": arrets, "trace": [],
-                })
-            return resultat
-
-    if numero or index_catalogue is not None:
-        sens_bus = _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero)
-        if sens_bus:
-            resultat["sens"] = sens_bus
-            resultat["nb_arrets"] = max(x["nb_arrets"] for x in sens_bus)
-
-    if not resultat["sens"]:
-        resultat["nb_arrets"] = 2
-        resultat["sens"] = [{
-            "direction": "A", "sens": "aller", "titre": f"{origine} → {destination}",
-            "depart": origine, "terminus": destination, "nb_arrets": 2,
-            "arrets": [
-                {"id": None, "nom": origine, "latitude": None, "longitude": None, "role": "depart"},
-                {"id": None, "nom": destination, "latitude": None, "longitude": None, "role": "arrivee"},
-            ],
-            "trace": [],
-        }]
-    return resultat
-
+                arrets[0]["role"], arrets[-1]["role"] = "depart", "arrivee"
+                res["sens"].append({"direction": "A" if s["sens"] == "aller" else "R", "sens": s["sens"],
+                                    "titre": f"{s['depart']} → {s['arrivee']}", "depart": s["depart"],
+                                    "terminus": s["arrivee"], "nb_arrets": s["nb_arrets"],
+                                    "arrets": arrets, "trace": []})
+            return res
+    sens_bus = _sens_ligne_bus(fiche, index, origine, destination, numero)
+    if sens_bus:
+        res["sens"], res["nb_arrets"] = sens_bus, max(x["nb_arrets"] for x in sens_bus)
+    else:                                              # aucun arrêt connu : on affiche au moins départ/arrivée
+        res["nb_arrets"] = 2
+        res["sens"] = [{"direction": "A", "sens": "aller", "titre": f"{origine} → {destination}",
+                        "depart": origine, "terminus": destination, "nb_arrets": 2, "trace": [],
+                        "arrets": [{"id": None, "nom": origine, "latitude": None, "longitude": None, "role": "depart"},
+                                   {"id": None, "nom": destination, "latitude": None, "longitude": None,
+                                    "role": "arrivee"}]}]
+    return res
 
 def recherche_globale(q: str, type_transport=None, maximum: int = 20) -> dict:
+    """Barre de recherche : lignes + arrêts qui contiennent tous les mots tapés."""
     mots = extraire_mots(q)
     if not mots:
         return {"lignes": [], "arrets": []}
-    lignes = lignes_pour_app(type_transport, q)["lignes"][:maximum]
-    arrets = []
-    for a in RESEAU["arrets"].values():
-        if a["id"] in RESEAU["points_libres"]:
-            continue
-        if all(m in nettoyer_texte(a["nom"]) for m in mots):
-            arrets.append(a)
-    return {"lignes": lignes, "arrets": arrets[:maximum]}
-
+    arrets = [a for a in RESEAU["arrets"].values() if a["id"] not in RESEAU["points_libres"]
+              and all(m in nettoyer_texte(a["nom"]) for m in mots)]
+    return {"lignes": lignes_pour_app(type_transport, q)["lignes"][:maximum], "arrets": arrets[:maximum]}
 
 def trajets_pour_demande(candidats, priorite=None, prix_max=None, budget=None):
+    """Trie les trajets par prix ou par durée (et applique le budget)."""
     if not candidats:
         return []
+    cout = lambda c: c.get("cout_partiel_fcfa", 0)
     if budget:
-        candidats = [c for c in candidats if _cout_tri(c) <= budget]
-    if priorite == "prix":
-        candidats.sort(key=lambda c: (_cout_tri(c), c.get("duree_minutes", 999)))
-    else:
-        candidats.sort(key=lambda c: (c.get("duree_minutes", 999), _cout_tri(c)))
+        candidats = [c for c in candidats if cout(c) <= budget]
+    candidats.sort(key=(lambda c: (cout(c), c.get("duree_minutes", 999))) if priorite == "prix"
+                   else (lambda c: (c.get("duree_minutes", 999), cout(c))))
     return candidats
 
-
 def instructions_trajet(candidat: dict) -> list:
+    """Liste de phrases simples décrivant le trajet."""
     if not candidat or not candidat.get("etapes"):
         return []
-    instructions = []
-    for e in candidat["etapes"]:
-        if e["mode"] == "MARCHE":
-            instructions.append(f"marchez {e['distance_m']} m jusqu a {e['arrivee']}")
-        else:
-            nom = e.get("numero_ligne") or e.get("nom_ligne") or e["mode"]
-            instructions.append(f"prenez le {e['mode'].lower()} {nom} de {e['depart']} a {e['arrivee']}")
-    return instructions
+    return [f"marchez {e['distance_m']} m jusqu a {e['arrivee']}" if e["mode"] == "MARCHE" else
+            f"prenez le {e['mode'].lower()} {e.get('numero_ligne') or e.get('nom_ligne') or e['mode']} "
+            f"de {e['depart']} a {e['arrivee']}" for e in candidat["etapes"]]
 
 
-def _texte_trajet(candidat, mode="TOUS"):
-    if not candidat:
-        return "aucun trajet trouve."
-    parts = []
-    for e in candidat.get("etapes", []):
-        if e["mode"] == "MARCHE":
-            if e.get("distance_m", 0) > 0:
-                parts.append(f"marchez {e['distance_m']} m jusqu a {e['arrivee']}")
-        else:
-            nom = e.get("numero_ligne") or e.get("nom_ligne") or ""
-            parts.append(f"{e['mode']} {nom} : {e['depart']} → {e['arrivee']}")
-    return " puis ".join(parts) + f" (environ {candidat.get('duree_minutes')} min)"
-
-
-# agent ia
-
+# ── 8. ASSISTANT MOBIGUIDE (comprendre le message + répondre avec le LLM Groq) ──
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-SESSIONS = defaultdict(lambda: {
-    "depart": None, "destination": None, "dernier_trajet": None,
-    "budget_fcfa": None, "mode_transport": None, "attente_mode": False,
-})
-
+# Mémoire de conversation : une case par session_id (départ, destination, budget, mode...)
+SESSIONS = defaultdict(lambda: {"depart": None, "destination": None, "dernier_trajet": None,
+                                "budget_fcfa": None, "mode_transport": None, "attente_mode": False})
 
 def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_mode=None):
+    """Met à jour la mémoire de la conversation avec ce que l'on vient de comprendre."""
     if not session_id:
         return
     s = SESSIONS[session_id]
-    if intention.get("intention") == "TRAJET":      # nouvelle recherche : on repart de zéro côté guidage
-        s["guidage_actif"], s["guidage_contexte"] = False, None
     for cle in ("depart", "destination"):
         if intention.get(cle):
             s[cle] = intention[cle]
@@ -2580,100 +1557,137 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if attente_mode is not None:
         s["attente_mode"] = attente_mode
         if attente_mode:
-            s["mode_demande"] = True  # la question « quel mode ? » n'est posée qu'une fois par conversation
+            s["mode_demande"] = True                   # la question « quel mode ? » n'est posée qu'une fois
 
+def extraire_budget(texte: str) -> Optional[int]:
+    """Comprend « j'ai 400 », « 400 balles », « moins de 300 », « 2 mille », « 1 500 francs »..."""
+    t = (texte or "").lower().replace(" ", " ").replace(" ", " ")
+    nombre = r"(\d{1,3}(?:[ .]\d{3})+|\d+)"
+    motifs = (nombre + r"\s*(?:mille|milles|k)\b",                                      # « 2 mille »
+              nombre + r"\s*(?:fcfa|f\.?\s?cfa|cfa|francs?|frs?\b|f\b|balles?|piastres?|billets?)",
+              r"(?:budget|maximum|max|co[uû]t|prix|dans les|moins de|pas plus de|jusqu['’]?\s?[àa]|"
+              r"j['’]?ai(?: seulement| juste| que)?|je n['’]?ai que|il me reste|me reste|je dispose de|"
+              r"je poss[eè]de|avec|(?:un )?petit budget de)\D{0,12}" + nombre,
+              r"\s*" + nombre + r"\s*[.!]?\s*")                                         # message = « 400 »
+    for n, motif in enumerate(motifs):
+        m = re.fullmatch(motif, t) if n == 3 else re.search(motif, t)
+        if m:
+            valeur = int(re.sub(r"\D", "", m.group(1))) * (1000 if n == 0 else 1)
+            return valeur if 50 <= valeur <= 1000000 else None
+    return None
+
+def extraire_mode(texte: str, accepter_tous: bool = False) -> Optional[str]:
+    """BUS / GBAKA / BATEAU / TOUS, ou None. Comprend la négation (« pas de bus », « sans gbaka »)."""
+    t = re.sub(r"bateau[\s_-]*bus", "bateau", nettoyer_texte(texte))
+    trouves = set()
+    for mode, mots in (("BATEAU", r"(bateau|bateaux|lagunaire|bato|monbato)"),
+                       ("GBAKA", r"(gbaka|gbakas|woro|woros)"), ("BUS", r"(bus|sotra|autobus|monbus)")):
+        nie = re.search(rf"(?:pas|sans|au lieu (?:de |du |des |d')|plut[oô]t que |non)\s*"
+                        rf"(?:le |la |les |un |une |des )?\b{mots}\b", t)
+        if re.search(rf"\b{mots}\b", t) and not nie:
+            trouves.add(mode)
+    if len(trouves) == 1:
+        return next(iter(trouves))
+    if len(trouves) > 1 or re.search(r"(tous les (modes|transports|moyens)|n.?importe (quel|lequel)|peu importe|"
+                                     r"indifferent|pas de preference)", t) \
+            or (accepter_tous and re.search(r"\b(tous|tout|les deux)\b", t)):
+        return "TOUS"
+    return None
+
+def _est_question_conditions(message: str) -> bool:
+    """Le message parle-t-il de trafic, de pluie, de météo ?"""
+    m = (message or "").lower()
+    return bool(re.search(r"(quel temps|le temps qu|il fait quel temps|niveau de (?:la )?pluie)", m)) or any(
+        w in m for w in ("embouteillage", "trafic", "circulation", "bouchon", "pressé", "presse",
+                         "pressée", "pluie", "pleut", "météo", "meteo"))
+
+def _extraire_infos_conditions(contexte: dict) -> str:
+    """Résume en une phrase le trafic et la météo calculés par le modèle ML."""
+    def premier(*cles):
+        return next((contexte[c] for c in cles if contexte.get(c) is not None), None)
+    trafic, pluie, facteur = premier("trafic_niveau", "trafic"), premier("pluie", "weather", "meteo"), contexte.get("trafic_facteur")
+    infos = []
+    if isinstance(trafic, str):
+        libelle = {"eleve": "dense", "moyen": "modéré", "faible": "fluide"}.get(nettoyer_texte(trafic), trafic)
+        extra = f", les trajets durent environ x{facteur:.2f}" if isinstance(facteur, (int, float)) and facteur > 1.05 else ""
+        infos.append(f"le trafic est {libelle}{extra}")
+    elif isinstance(trafic, (int, float)):
+        etat = "dense" if trafic >= 0.7 else "modéré" if trafic >= 0.4 else "fluide"
+        infos.append(f"le trafic est {etat} (niveau {trafic:.2f})")
+    elif trafic is not None:
+        infos.append(f"niveau de trafic : {trafic}")
+    if isinstance(pluie, bool):
+        infos.append("il pleut" if pluie else "il ne pleut pas")
+    elif isinstance(pluie, (int, float)):
+        infos.append(f"il pleut (intensité {pluie:.2f})" if pluie > 0.5 else f"il ne pleut pas (intensité {pluie:.2f})")
+    elif pluie is not None:
+        infos.append(f"météo : {pluie}")
+    return " ; ".join(infos) if infos else "conditions normales (non calculées)"
+
+def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
+    """Complète le résultat de l'analyse avec la mémoire de la session (départ, budget, mode...)."""
+    if data.setdefault("intention", "INCONNUE") == "INCONNUE":
+        data["intention"] = "CONVERSATION"             # jamais de réponse figée : on discute normalement
+    if data["intention"] == "SUIVI" and not s.get("dernieres_options"):
+        data["intention"] = "CONVERSATION"
+    for cle in ("depart", "destination", "priorite", "prix_max_ligne"):
+        data.setdefault(cle, None)
+    data.update(mode_transport="TOUS", mode_precise=False, budget_fcfa=None)
+    if data["intention"] in ("TRAJET", "LIGNES_TRAJET"):
+        for cle in ("depart", "destination"):
+            vide = data.get(cle) is None or (isinstance(data[cle], str) and data[cle].strip().lower() in ("", "null", "none", "aucun"))
+            data[cle] = (None if vide else data[cle]) or s.get(cle)
+        if mode_msg:
+            data["mode_transport"], data["mode_precise"] = mode_msg, True
+        elif s.get("mode_demande"):
+            data["mode_precise"] = True                # question « quel mode ? » déjà posée : on cherche dans TOUS
+        data["budget_fcfa"] = budget_msg or s.get("budget_fcfa")   # (le mode de session n'est PAS réutilisé)
+    return data
+
+def _trajet_demande(s, mode, mode_precise, budget, **plus) -> dict:
+    """Intention « TRAJET » qui réutilise le départ et la destination déjà connus."""
+    return {"intention": "TRAJET", "depart": s.get("depart"), "destination": s.get("destination"),
+            "mode_transport": mode, "mode_precise": mode_precise, "priorite": None,
+            "budget_fcfa": budget, "prix_max_ligne": None, **plus}
 
 def analyser_intention(message: str, historique: list = None, session_id: str = None) -> dict:
+    """Comprend le message : TRAJET, SUIVI (question sur les trajets), CONVERSATION... + lieux/budget/mode."""
     s = SESSIONS[session_id] if session_id else {}
     _EXCLURE.set(None)
-    attente = bool(s.get("attente_mode"))
-    mode_msg = extraire_mode(message, accepter_tous=attente)
-    budget_msg = extraire_budget(message)
-
-    s["guidage_msg"] = None   # propre à CE message
-    t = nettoyer_texte(message)
-    if _est_guidage(message) or _dit_sa_position(message, s):
-        # « je suis à X, je ne trouve pas Y » : on accompagne, on ne relance pas un trajet
-        s["guidage_msg"], s["guidage_actif"] = {}, True
-        return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
-
+    msg = nettoyer_texte(message)
+    mode_msg, budget_msg = extraire_mode(message, accepter_tous=bool(s.get("attente_mode"))), extraire_budget(message)
+    question = re.search(r"(c.?est quoi|qu.?est.?ce|\bpourquoi\b|comment fonctionne|\bcombien\b|est.?ce que|"
+                         r"\bou est\b|\bquel(le)?s? (est|sont)\b)", msg)
+    # 1) Règles rapides (sans LLM)
     if re.search(r"(comment (tu|vous) (t|vous )?.?appel|qui (es|etes).?(tu|vous)|tu es qui|ton nom|"
-                 r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", nettoyer_texte(message)):
+                 r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", msg):
         return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
-
-    if s.get("dernieres_options") and re.search(
-            r"(pas convaincu|ne me convient pas|ça ne me convient pas|ca ne me convient pas|"
-            r"autre trajet|autre option|change|changer|propose autre|quelque chose d.?autre|"
-            r"non,? merci|je n.?aime pas|je (ne )?veux (pas|plus)|pas (ce|cet|celui|ces|ceux)|"
-            r"enleve|retire|sans ce trajet)", nettoyer_texte(message)):
+    if s.get("dernieres_options") and re.search(           # « pas celui-là, autre chose »
+            r"(pas convaincu|ne me convient pas|ça ne me convient pas|ca ne me convient pas|autre trajet|"
+            r"autre option|change|changer|propose autre|quelque chose d.?autre|non,? merci|je n.?aime pas|"
+            r"je (ne )?veux (pas|plus)|pas (ce|cet|celui|ces|ceux)|enleve|retire|sans ce trajet)", msg):
         _EXCLURE.set(list(s.get("dernieres_options") or []))
-        def signature_option(option):
-            return tuple(
-                (e.get("mode"), e.get("numero_ligne") or e.get("nom_ligne"),
-                 e.get("depart"), e.get("arrivee"))
-                for e in option.get("etapes", [])
-                if e.get("mode") != "MARCHE"
-            )
-
-        return {
-            "intention": "TRAJET", "depart": s.get("depart"),
-            "destination": s.get("destination"),
-            "mode_transport": mode_msg or "TOUS", "mode_precise": bool(mode_msg),
-            "priorite": None, "budget_fcfa": budget_msg or s.get("budget_fcfa"),
-            "prix_max_ligne": None,
-            "exclure_signatures": [signature_option(option)
-                                   for option in s.get("dernieres_options", [])],
-        }
-
-    if attente and mode_msg and s.get("destination"):
-        return {
-            "intention": "TRAJET", "depart": s.get("depart"),
-            "destination": s.get("destination"),
-            "mode_transport": mode_msg, "mode_precise": True, "priorite": None,
-            "budget_fcfa": budget_msg or s.get("budget_fcfa"), "prix_max_ligne": None,
-        }
-
-    if mode_msg and s.get("destination") and not re.search(
-            r"(c.?est quoi|qu.?est.?ce|\bpourquoi\b|comment fonctionne|\bcombien\b|est.?ce que|"
-            r"\bou est\b|\bquel(le)?s? (est|sont)\b)", nettoyer_texte(message)):
-        return {
-            "intention": "TRAJET", "depart": s.get("depart"),
-            "destination": s.get("destination"),
-            "mode_transport": mode_msg, "mode_precise": True, "priorite": None,
-            "budget_fcfa": budget_msg or s.get("budget_fcfa"), "prix_max_ligne": None,
-        }
-
+        return _trajet_demande(s, mode_msg or "TOUS", bool(mode_msg), budget_msg or s.get("budget_fcfa"),
+                               exclure_signatures=[_signature(o) for o in s["dernieres_options"]])
+    if mode_msg and s.get("destination") and (s.get("attente_mode") or not question):   # « et en gbaka ? »
+        return _trajet_demande(s, mode_msg, True, budget_msg or s.get("budget_fcfa"))
     if budget_msg and s.get("destination") and (s.get("depart") or s.get("dernieres_options")) \
-            and not re.search(r"\bcombien\b|c.?est quoi|\bpourquoi\b|\bcomment fonctionne\b", nettoyer_texte(message)):
-        mode_session = s.get("mode_transport")
-        return {
-            "intention": "TRAJET", "depart": s.get("depart"),
-            "destination": s.get("destination"),
-            "mode_transport": mode_msg or mode_session or "TOUS",
-            "mode_precise": bool(mode_msg or mode_session), "priorite": None,
-            "budget_fcfa": budget_msg, "prix_max_ligne": None,
-        }
-
+            and not re.search(r"\bcombien\b|c.?est quoi|\bpourquoi\b|\bcomment fonctionne\b", msg):
+        mode_session = s.get("mode_transport")                                           # « j'ai 400 »
+        return _trajet_demande(s, mode_msg or mode_session or "TOUS", bool(mode_msg or mode_session), budget_msg)
     if not client:
-        msg = message.lower()
-        if any(m in msg for m in ("bonjour", "salut", "merci", "hello", "bonsoir")):
-            return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
-        return _completer_analyse({"intention": "INCONNUE"}, s, mode_msg, budget_msg)
-
-    historique = historique or []
-    historique_texte = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}"
-                                   for m in historique[-10:])
-
-    memoire_txt = ""
+        salut = any(m in message.lower() for m in ("bonjour", "salut", "merci", "hello", "bonsoir"))
+        return _completer_analyse({"intention": "CONVERSATION" if salut else "INCONNUE"}, s, mode_msg, budget_msg)
+    # 2) Sinon on demande au LLM de classer le message (réponse JSON)
+    historique_texte = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in (historique or [])[-10:])
+    memoire = ""
     if s.get("depart") or s.get("destination"):
-        memoire_txt = f"""
+        memoire = f"""
 Mémoire de la session :
 - Dernier départ connu : {s.get('depart') or 'inconnu'}
 - Dernière destination connue : {s.get('destination') or 'inconnue'}
 - Budget connu : {s.get('budget_fcfa') or 'aucun'}
 - Mode connu : {s.get('mode_transport') or 'non précisé'}
-
-Guidage en cours : {'oui, l utilisateur est en déplacement et tu l accompagnes' if s.get('guidage_actif') else 'non'}
 
 RÈGLES DE SUIVI :
 - Le message CHANGE ou RELANCE la recherche (autre mode : "et en gbaka ?", autre départ : "et depuis Yopougon ?",
@@ -2684,248 +1698,35 @@ RÈGLES DE SUIVI :
 - Tout le reste (salutation, merci, blague, culture générale, avis, conseil, question sans rapport avec ce trajet,
   même juste après un trajet) -> intention = CONVERSATION. Dans ce cas on ne renvoie JAMAIS d'itinéraire.
 """
-
-    regle_guidage = """- intention = "GUIDAGE" quand l'utilisateur est déjà en chemin ou sur place et veut être accompagné : il dit où il
-  est ("je suis à Adjamé Liberté", "je suis devant la pharmacie"), ce qu'il voit, qu'il est perdu, qu'il ne trouve pas
-  une gare / un arrêt, qu'il est monté dans le bus ou le gbaka, qu'il est arrivé quelque part, ou demande "et maintenant ?"
-  / "je fais quoi ?" / "où je descends ?" pendant son déplacement. Dans ce cas remplis lieu_actuel (le lieu ou repère
-  où il se trouve, sinon null) et recherche (ce qu'il cherche : "gare gbaka", "arrêt de bus", ... sinon null)."""
-    prompt = f"""Tu es un assistant de transport à Abidjan.
-Analyse le message de l'utilisateur et réponds UNIQUEMENT avec un JSON valide.
-
+    prompt = f"""Tu es un assistant de transport à Abidjan. Réponds UNIQUEMENT avec un JSON valide.
 Message : "{message}"
-
 Historique récent :
 {historique_texte}
-{memoire_txt}
-
-Réponds exactement avec ce format JSON :
-{{
-  "intention": "TRAJET" ou "SUIVI" ou "GUIDAGE" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
-  "lieu_actuel": "où il se trouve ou null (GUIDAGE seulement)",
-  "recherche": "ce qu'il cherche ou null (GUIDAGE seulement)",
-  "depart": "lieu de départ ou null",
-  "destination": "lieu d'arrivée ou null",
-  "priorite": "duree" ou "prix" ou null,
-  "prix_max_ligne": nombre ou null
-}}
-
-Règles importantes :
-- Si l'utilisateur dit "ma position", "ici", "je suis là", "près de moi" alors depart = "ma position actuelle"
-- intention = "CONVERSATION" pour TOUT ce qui n'est pas une demande de déplacement : salutation,
-  remerciement, discussion libre, culture générale, blague, question sur toi, etc.
-- intention = "TRAJET" uniquement si l'utilisateur veut aller quelque part ou relance/modifie la recherche de trajet
-{regle_guidage}
-- N'invente jamais un lieu : mets null si le lieu n'est pas dans le message ou dans la mémoire
-- Ne mets jamais de texte en dehors du JSON
+{memoire}
+Format exact :
+{{"intention": "TRAJET" ou "SUIVI" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "depart": "lieu de départ ou null", "destination": "lieu d'arrivée ou null",
+  "priorite": "duree" ou "prix" ou null, "prix_max_ligne": nombre ou null}}
+Règles :
+- "ma position", "ici", "je suis là", "près de moi" -> depart = "ma position actuelle"
+- CONVERSATION pour TOUT ce qui n'est pas un déplacement (salutation, merci, culture générale, blague, question sur toi...)
+- TRAJET uniquement si l'utilisateur veut aller quelque part ou relance/modifie la recherche
+- N'invente jamais un lieu : null s'il n'est ni dans le message ni dans la mémoire. Rien en dehors du JSON.
 """
-
     try:
-        reponse = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": "Tu réponds uniquement en JSON valide, sans aucun texte autour."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1, max_tokens=400,
-        )
-        texte = reponse.choices[0].message.content.strip()
-        debut = texte.find("{")
-        fin = texte.rfind("}") + 1
+        r = client.chat.completions.create(
+            model=MODEL, temperature=0.1, max_tokens=400,
+            messages=[{"role": "system", "content": "Tu réponds uniquement en JSON valide, sans aucun texte autour."},
+                      {"role": "user", "content": prompt}])
+        texte = r.choices[0].message.content.strip()
+        debut, fin = texte.find("{"), texte.rfind("}") + 1
         if debut >= 0 and fin > debut:
-            data = json.loads(texte[debut:fin])
-            if data.get("intention") == "GUIDAGE":
-                vide = _valeur_vide
-                s["guidage_msg"] = {"lieu": None if vide(data.get("lieu_actuel")) else data["lieu_actuel"],
-                                    "recherche": None if vide(data.get("recherche")) else data["recherche"]}
-                s["guidage_actif"], data["intention"] = True, "CONVERSATION"
-            return _completer_analyse(data, s, mode_msg, budget_msg)
+            return _completer_analyse(json.loads(texte[debut:fin]), s, mode_msg, budget_msg)
     except Exception as e:
         log.error("erreur analyse intention : %s", e)
     return _completer_analyse({"intention": "INCONNUE"}, s, mode_msg, budget_msg)
 
-
-def _extraire_infos_conditions(contexte: dict) -> str:
-    infos = []
-    trafic = contexte.get("trafic_niveau")
-    if trafic is None:
-        trafic = contexte.get("trafic")
-    pluie = contexte.get("pluie")
-    if pluie is None:
-        pluie = contexte.get("weather")
-    if pluie is None:
-        pluie = contexte.get("meteo")
-
-    facteur = contexte.get("trafic_facteur")
-    if isinstance(trafic, str):
-        libelle = {"eleve": "dense", "moyen": "modéré", "faible": "fluide"}.get(
-            nettoyer_texte(trafic), trafic)
-        extra = f", les trajets durent environ x{facteur:.2f}" \
-            if isinstance(facteur, (int, float)) and facteur > 1.05 else ""
-        infos.append(f"le trafic est {libelle}{extra}")
-        trafic = None
-
-    if trafic is not None:
-        if isinstance(trafic, (int, float)):
-            if trafic >= 0.7:
-                infos.append(f"le trafic est dense (niveau {trafic:.2f})")
-            elif trafic >= 0.4:
-                infos.append(f"le trafic est modéré (niveau {trafic:.2f})")
-            else:
-                infos.append(f"le trafic est fluide (niveau {trafic:.2f})")
-        else:
-            infos.append(f"niveau de trafic : {trafic}")
-
-    if pluie is not None:
-        if isinstance(pluie, bool):
-            infos.append("il pleut" if pluie else "il ne pleut pas")
-        elif isinstance(pluie, (int, float)):
-            if pluie > 0.5:
-                infos.append(f"il pleut (intensité {pluie:.2f})")
-            else:
-                infos.append(f"il ne pleut pas (intensité {pluie:.2f})")
-        else:
-            infos.append(f"météo : {pluie}")
-
-    return " ; ".join(infos) if infos else "conditions normales (non calculées)"
-
-
-def _est_question_conditions(message: str) -> bool:
-    m = (message or "").lower()
-    if re.search(r"(quel temps|le temps qu|il fait quel temps|niveau de (?:la )?pluie)", m):
-        return True
-    return any(w in m for w in (
-        "embouteillage", "trafic", "circulation", "bouchon", "pressé", "presse",
-        "pressée", "pluie", "pleut", "météo", "meteo",
-    ))
-
-
-def extraire_budget(texte: str) -> Optional[int]:
-    """Comprend le langage naturel : « j'ai 400 », « 400 balles », « je n'ai que 500f »,
-    « moins de 300 », « 2 mille », « 1 500 francs »..."""
-    t = (texte or "").lower().replace("\u202f", " ").replace("\u00a0", " ")
-    nombre = r"(\d{1,3}(?:[ .]\d{3})+|\d+)"
-    valeur = None
-    m = re.search(nombre + r"\s*(?:mille|milles|k)\b", t)          # « 2 mille », « 2k »
-    if m:
-        valeur = int(re.sub(r"\D", "", m.group(1))) * 1000
-    if valeur is None:
-        m = re.search(nombre + r"\s*(?:fcfa|f\.?\s?cfa|cfa|francs?|frs?\b|f\b|balles?|piastres?|billets?)", t)
-        if m:
-            valeur = int(re.sub(r"\D", "", m.group(1)))
-    if valeur is None:
-        m = re.search(r"(?:budget|maximum|max|co[uû]t|prix|dans les|moins de|pas plus de|jusqu['’]?\s?[àa]|"
-                      r"j['’]?ai(?: seulement| juste| que)?|je n['’]?ai que|il me reste|me reste|je dispose de|"
-                      r"je poss[eè]de|avec|(?:un )?petit budget de)\D{0,12}" + nombre, t)
-        if m:
-            valeur = int(re.sub(r"\D", "", m.group(1)))
-    if valeur is None:
-        m = re.fullmatch(r"\s*" + nombre + r"\s*[.!]?\s*", t)       # message = juste « 400 »
-        if m:
-            valeur = int(re.sub(r"\D", "", m.group(1)))
-    return valeur if valeur is not None and 50 <= valeur <= 1000000 else None
-
-
-def extraire_mode(texte: str, accepter_tous: bool = False) -> Optional[str]:
-    """BUS / GBAKA / BATEAU / TOUS, ou None si l'utilisateur n'a rien précisé.
-    Gère la négation : « pas de bus », « sans gbaka », « au lieu du bus »."""
-    t = nettoyer_texte(texte)
-    t = re.sub(r"bateau[\s_-]*bus", "bateau", t)
-
-    def _nie(mot_pat: str) -> bool:
-        return bool(re.search(
-            rf"(?:pas|sans|au lieu (?:de |du |des |d')|plut[oô]t que |non)\s*"
-            rf"(?:le |la |les |un |une |des )?{mot_pat}", t))
-
-    trouves = set()
-    if re.search(r"\b(bateau|bateaux|lagunaire|bato|monbato)\b", t) \
-       and not _nie(r"\b(bateau|bateaux)\b"):
-        trouves.add("BATEAU")
-    if re.search(r"\b(gbaka|gbakas|woro|woros)\b", t) \
-       and not _nie(r"\b(gbaka|gbakas|woro|woros)\b"):
-        trouves.add("GBAKA")
-    if re.search(r"\b(bus|sotra|autobus|monbus)\b", t) \
-       and not _nie(r"\b(bus|sotra|autobus|monbus)\b"):
-        trouves.add("BUS")
-
-    if len(trouves) == 1:
-        return next(iter(trouves))
-    if len(trouves) > 1:
-        return "TOUS"
-    if re.search(r"(tous les (modes|transports|moyens)|n.?importe (quel|lequel)|peu importe|indifferent|pas de preference)", t):
-        return "TOUS"
-    if accepter_tous and re.search(r"\b(tous|tout|les deux)\b", t):
-        return "TOUS"
-    return None
-
-
-def _valeur_vide(v) -> bool:
-    return v is None or (isinstance(v, str) and v.strip().lower() in ("", "null", "none", "aucun"))
-
-
-#  _completer_analyse — pas de réutilisation du mode pour une nouvelle demande
-def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
-    data.setdefault("intention", "INCONNUE")
-    if data["intention"] == "INCONNUE":
-        data["intention"] = "CONVERSATION"   # jamais de réponse figée : on discute normalement
-    if data["intention"] == "SUIVI" and not s.get("dernieres_options"):
-        data["intention"] = "CONVERSATION"
-    data.setdefault("depart", None)
-    data.setdefault("destination", None)
-    data.setdefault("priorite", None)
-    data.setdefault("prix_max_ligne", None)
-    data["mode_transport"] = "TOUS"
-    data["mode_precise"] = False
-    data["budget_fcfa"] = None
-
-    if data["intention"] in ("TRAJET", "LIGNES_TRAJET"):
-        for cle in ("depart", "destination"):
-            valeur = None if _valeur_vide(data.get(cle)) else data[cle]
-            data[cle] = valeur or s.get(cle)
-        if mode_msg:
-            data["mode_transport"], data["mode_precise"] = mode_msg, True
-        elif s.get("mode_demande"):
-            data["mode_precise"] = True  # déjà demandé plus tôt : on ne repose pas la question, tous les modes
-        # On ne réutilise PAS le mode de session pour une nouvelle demande :
-        # si l'utilisateur ne précise pas le mode, on cherche dans TOUS les modes.
-        data["budget_fcfa"] = budget_msg or s.get("budget_fcfa")
-    return data
-
-
-def _prix_texte(c: dict) -> str:
-    if not c:
-        return "inconnu"
-    p = c.get("cout_fcfa")
-    if p is not None:
-        return f"{p} FCFA"
-    base = "variable (le tarif des gbakas / woro-woro dépend du chauffeur ou de l'apprenti)"
-    partiel = c.get("cout_partiel_fcfa") or 0
-    return f"{base}, partie bus/bateau : {partiel} FCFA" if partiel else base
-
-
-def _points_cles(c: dict) -> str:
-    out = []
-    for e in c.get("etapes", []):
-        if e["mode"] == "MARCHE":
-            continue
-        ligne = e.get("numero_ligne") or e.get("nom_ligne") or e["mode"]
-        n = e.get("nb_arrets") or 0
-        rang = f" (au {'1er' if n == 1 else str(n) + 'e'} arrêt)" if n > 0 else ""
-        out.append(f"{e['mode'].lower()} {ligne} : montée à {e['depart']}, descente à {e['arrivee']}{rang}")
-    return " ; ".join(out)
-
-
-def _messages_llm(systeme: str, prompt: str, historique: list) -> list:
-    msgs = [{"role": "system", "content": systeme}]
-    for m in (historique or [])[-10:]:
-        role = "assistant" if m.get("role") in ("assistant", "model", "bot") else "user"
-        contenu = str(m.get("content", "")).strip()
-        if contenu:
-            msgs.append({"role": role, "content": contenu})
-    msgs.append({"role": "user", "content": prompt})
-    return msgs
-
-
+# ── Textes de réponse ────────────────────────────────────────────────────────
 SYSTEME_AMI = (
     "Tu es MobiGuide, un assistant sympa basé à Abidjan. Tu discutes naturellement, comme un ami : "
     "tu réponds à toutes les questions (pas seulement les transports), en français, de façon courte "
@@ -2936,10 +1737,7 @@ SYSTEME_AMI = (
     "Tu t'appelles MobiGuide, l'assistant de l'application MobiGo. Tu es toujours accueillant, chaleureux et tu "
     "guides l'utilisateur ; tu ne refuses jamais de répondre à une question simple. "
     "Si tu ne connais pas la réponse, dis-le clairement et demande une précision ; "
-    "n'invente jamais une information, une ligne, un prix ou une fonctionnalité."
-)
-
-
+    "n'invente jamais une information, une ligne, un prix ou une fonctionnalité.")
 SYSTEME_TRAJET = (
     "Tu es MobiGuide, assistant de transport à Abidjan, chaleureux et naturel, comme un ami qui "
     "connaît bien la ville. Tu réponds toujours en français. Tu ne répètes jamais une formule "
@@ -2947,26 +1745,52 @@ SYSTEME_TRAJET = (
     "d'arrêt et tu ne renvoies jamais vers Google Maps ou Waze. "
     "Quand un mode de transport est demandé (bateau-bus, bus, gbaka) et qu'aucun trajet n'existe "
     "dans ce mode, dis-le clairement et propose d'autres modes uniquement si l'utilisateur le demande. "
-    "Ne dis jamais « il n'y a pas de trajet en bateau-bus » puis propose encore des trajets qui contiennent du bateau-bus."
-)
+    "Ne dis jamais « il n'y a pas de trajet en bateau-bus » puis propose encore des trajets qui contiennent du bateau-bus.")
 
+def _messages_llm(systeme: str, prompt: str, historique: list) -> list:
+    """Messages envoyés au LLM : consigne + 10 derniers échanges + question."""
+    msgs = [{"role": "system", "content": systeme}]
+    for m in (historique or [])[-10:]:
+        contenu = str(m.get("content", "")).strip()
+        if contenu:
+            msgs.append({"role": "assistant" if m.get("role") in ("assistant", "model", "bot") else "user",
+                         "content": contenu})
+    return msgs + [{"role": "user", "content": prompt}]
+
+def _phrase_complete(texte: str, fini_par_limite: bool) -> str:
+    """Si le LLM a été coupé (max_tokens), on garde seulement les phrases terminées."""
+    texte = (texte or "").strip()
+    if not fini_par_limite or not texte or re.search(r"[.!?…][^\w\s]{0,3}\s*$", texte):
+        return texte
+    fin = max(texte.rfind(c) for c in ".!?…")
+    return texte[:fin + 1].strip() if fin > 20 else texte
+
+def _prix_texte(c: dict) -> str:
+    if not c:
+        return "inconnu"
+    if c.get("cout_fcfa") is not None:
+        return f"{c['cout_fcfa']} FCFA"
+    base = "variable (le tarif des gbakas / woro-woro dépend du chauffeur ou de l'apprenti)"
+    partiel = c.get("cout_partiel_fcfa") or 0
+    return f"{base}, partie bus/bateau : {partiel} FCFA" if partiel else base
+
+def _ordinal(n: int) -> str:
+    return "1er" if n == 1 else f"{n}e"
+
+def _points_cles(c: dict) -> str:
+    return " ; ".join(
+        f"{e['mode'].lower()} {e.get('numero_ligne') or e.get('nom_ligne') or e['mode']} : montée à {e['depart']}, "
+        f"descente à {e['arrivee']}" + (f" (au {_ordinal(e['nb_arrets'])} arrêt)" if (e.get("nb_arrets") or 0) > 0 else "")
+        for e in c.get("etapes", []) if e["mode"] != "MARCHE")
 
 def _conseils_liste(options: list, budget=None) -> list:
     """Conseils pratiques selon les modes réellement proposés : liste de (clé, texte)."""
-    modes = set()
-    for c in (options or [])[:4]:
-        for e in c.get("etapes", []):
-            if e.get("mode") != "MARCHE":
-                modes.add(e["mode"])
-    out = []
-    if "BUS" in modes:
-        out.append(("BUS", "En bus, prends ton ticket ou badge ta carte auprès du machiniste."))
-    if "GBAKA" in modes:
-        out.append(("GBAKA", "Pour les gbakas, le prix n'est pas fixe : demande-le à l'apprenti avant de monter."))
-    if "WORO_WORO" in modes:
-        out.append(("WORO_WORO", "Pour un woro-woro, demande le prix au chauffeur avant de monter."))
-    if "BATEAU" in modes:
-        out.append(("BATEAU", "Pour le bateau-bus, garde ton ticket jusqu'à la descente."))
+    modes = {e["mode"] for c in (options or [])[:4] for e in c.get("etapes", []) if e.get("mode") != "MARCHE"}
+    textes = [("BUS", "En bus, prends ton ticket ou badge ta carte auprès du machiniste."),
+              ("GBAKA", "Pour les gbakas, le prix n'est pas fixe : demande-le à l'apprenti avant de monter."),
+              ("WORO_WORO", "Pour un woro-woro, demande le prix au chauffeur avant de monter."),
+              ("BATEAU", "Pour le bateau-bus, garde ton ticket jusqu'à la descente.")]
+    out = [(m, t) for m, t in textes if m in modes]
     if modes:
         out.append(("SIGNALER", "Signale ton arrêt de descente au chauffeur ou à l'apprenti."))
     if budget and modes & {"GBAKA", "WORO_WORO"}:
@@ -2974,61 +1798,24 @@ def _conseils_liste(options: list, budget=None) -> list:
     return out
 
 
-def conseils_trajet(options: list, budget=None) -> str:
-    return " ".join(t for _, t in _conseils_liste(options, budget))
-
-
-def _phrase_complete(texte: str, fini_par_limite: bool) -> str:
-    """Si le LLM a été coupé (max_tokens), on garde seulement les phrases terminées."""
-    texte = (texte or "").strip()
-    if not fini_par_limite or not texte:
-        return texte
-    fin = max(texte.rfind(c) for c in ".!?…")
-    emoji = re.search(r"[.!?…][^\w\s]{0,3}\s*$", texte)
-    if emoji:
-        return texte
-    return texte[:fin + 1].strip() if fin > 20 else texte
-
-
-def _habiller_reponse(texte: str, options: list, budget=None) -> str:
-    texte = (texte or "").strip()
-    conseils = conseils_trajet(options, budget)
-    if conseils:
-        bas = texte.lower()
-        if sum(1 for k in ("ticket", "badg", "apprenti", "chauffeur", "signale") if k in bas) < 2:
-            texte += "\n\n💡 " + conseils
-    return texte
-
-
 def _dist_txt(m) -> str:
     m = int(m or 0)
     return f"{m / 1000:.1f} km".replace(".", ",") if m >= 1000 else f"{m} m"
 
-
-def _ordinal(n: int) -> str:
-    return "1er" if n == 1 else f"{n}e"
-
-
-_NOM_MODE = {"BUS": "le bus", "GBAKA": "le gbaka", "BATEAU": "le bateau-bus"}
-
-
 def decrire_trajet(c: dict) -> str:
-    """Raconte le trajet étape par étape : marche jusqu'à l'arrêt, montée, rang de l'arrêt de
-    descente (avec son nom), correspondance. Tout vient des données calculées, rien d'inventé."""
+    """Raconte le trajet étape par étape (marche, montée, rang de l'arrêt de descente, correspondance).
+    Tout vient des données calculées, rien n'est inventé."""
     etapes = c.get("etapes", []) or []
-    idx_transports = [i for i, e in enumerate(etapes) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
-    dernier_t = idx_transports[-1] if idx_transports else -1
-    lignes = []
-    derniere_arrivee = None
+    transports = [i for i, e in enumerate(etapes) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
+    dernier_t = transports[-1] if transports else -1
+    lignes, derniere_arrivee = [], None
     for i, e in enumerate(etapes):
         mode, d = e.get("mode"), e.get("distance_m", 0) or 0
         if mode == "MARCHE":
             if d < 30:
                 continue
-            minutes = e.get("duree_minutes")
-            duree = f" (environ {minutes} min)" if minutes else ""
-            avant_transport = any(x.get("mode") != "MARCHE" for x in etapes[i + 1:])
-            if avant_transport:
+            duree = f" (environ {e['duree_minutes']} min)" if e.get("duree_minutes") else ""
+            if any(x.get("mode") != "MARCHE" for x in etapes[i + 1:]):
                 t = f"Marche {_dist_txt(d)} jusqu'à l'arrêt « {e.get('arrivee')} »{duree}."
                 if d > SEUIL_MARCHE_LONGUE_M:
                     t += " C'est assez loin : tu peux aussi prendre un taxi ou un gbaka/woro-woro pour t'y rendre."
@@ -3038,374 +1825,136 @@ def decrire_trajet(c: dict) -> str:
                     t += " C'est assez long : un taxi ou un woro-woro peut t'y déposer."
             lignes.append(t)
         elif mode == "WORO_WORO":
-            lignes.append(f"Pour rejoindre l'arrêt « {e.get('arrivee')} » ({_dist_txt(d)}), "
-                          f"prends un woro-woro ou un taxi.")
+            lignes.append(f"Pour rejoindre l'arrêt « {e.get('arrivee')} » ({_dist_txt(d)}), prends un woro-woro ou un taxi.")
         else:
-            if derniere_arrivee and derniere_arrivee != e.get("depart") and i > 0 \
-                    and etapes[i - 1].get("mode") != "MARCHE":
+            if derniere_arrivee and derniere_arrivee != e.get("depart") and etapes[i - 1].get("mode") != "MARCHE":
                 lignes.append(f"Rejoins l'arrêt « {e.get('depart')} » (tout près, à pied).")
-            ligne = e.get("numero_ligne")
-            nom = _NOM_MODE.get(mode, str(mode).lower()) + (f" {ligne}" if ligne else "")
+            nom = "le " + NOM_MODE.get(mode, str(mode).lower()) + (f" {e['numero_ligne']}" if e.get("numero_ligne") else "")
             n = e.get("nb_arrets") or 0
-            descente = (f"descends au {_ordinal(n)} arrêt, à « {e.get('arrivee')} »" if n > 0
-                        else f"descends à « {e.get('arrivee')} »")
-            t = f"Monte dans {nom} à « {e.get('depart')} », puis {descente}"
-            t += " pour prendre la correspondance." if i < dernier_t else "."
-            lignes.append(t)
+            descente = f"descends au {_ordinal(n)} arrêt, à « {e.get('arrivee')} »" if n > 0 else f"descends à « {e.get('arrivee')} »"
+            lignes.append(f"Monte dans {nom} à « {e.get('depart')} », puis {descente}"
+                          + (" pour prendre la correspondance." if i < dernier_t else "."))
             derniere_arrivee = e.get("arrivee")
     return "\n".join(f"{k}. {t}" for k, t in enumerate(lignes, 1))
 
+def message_aucun_trajet(mode: str, dep: dict = None, dest: dict = None) -> str:
+    """Message CLAIR quand aucun trajet n'existe dans le mode demandé (ex : bateau-bus).
+    On dit non, on cite les arrêts les plus proches de ce mode, et on propose UNIQUEMENT les AUTRES modes."""
+    lib = NOM_MODE.get(mode, (mode or "").lower())
+    texte = f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux."
+    if dep and dest and mode in ("BUS", "GBAKA", "BATEAU"):
+        proches = []
+        for qui, lieu in (("ton départ", dep), ("ta destination", dest)):
+            a = arrets_proximite_par_modes(lieu["latitude"], lieu["longitude"], 5000, [mode])[:1]
+            if a:
+                proches.append(f"{qui} : « {a[0]['nom']} » à {_dist_txt(a[0]['distance_m'])}")
+        texte += (f" L'arrêt de {lib} le plus proche de " + " et de ".join(proches) + ".") if proches else \
+            f" Il n'y a pas d'arrêt de {lib} près de ces lieux."
+    autres = [NOM_MODE[m] for m in ("BUS", "GBAKA", "BATEAU") if m != mode]
+    return texte + f" Je peux chercher en {' ou en '.join(autres)}, ou avec tous les modes : tu veux ?"
 
-_LIBELLE_MODE = {"BUS": "bus", "GBAKA": "gbaka", "BATEAU": "bateau-bus"}
-
-
-def _intro_trajet(message: str, contexte: dict, candidats: list, mode: str,
-                  historique: list, premiere: bool, memoire_txt: str, infos_conditions: str) -> str:
+def _intro_trajet(message, contexte, candidats, mode, historique, premiere, memoire_txt, infos_conditions) -> str:
+    """Une phrase d'introduction naturelle (LLM) avant la liste des étapes."""
     modele = "Voici ce que je te propose !" if premiere else "Voici ce que j'ai trouvé."
     if not client:
         return modele
-    consigne = (
-        "C'est la première fois que tu présentes des trajets dans cette conversation : accueille "
-        "l'utilisateur chaleureusement."
-        if premiere else
-        "Tu as déjà présenté des trajets dans cette conversation : fais une phrase courte et "
-        "naturelle, SANS formule d'accueil (pas de « avec plaisir », « bonne nouvelle », « super »), "
-        "qui reconnaît ce qu'il vient de demander (autre mode, autre budget, autre trajet...)."
-    )
-    prompt = (
-        f'L\'utilisateur vient de demander : "{message}".\n'
-        f"Tu as trouvé {len(candidats)} option(s). Mode demandé : {mode}. "
-        f"Budget : {contexte.get('budget_fcfa') or 'aucun'}.\n"
-        f"Conditions actuelles (à ne mentionner que si c'est vraiment utile) : {infos_conditions or 'aucune'}\n"
-        f"{consigne}\n"
-        "Écris UNE seule phrase de 25 mots maximum. Ne décris pas les étapes (elles seront écrites "
-        "juste après), ne donne aucun conseil, n'invente rien."
-    )
+    consigne = ("C'est la première fois que tu présentes des trajets dans cette conversation : accueille "
+                "l'utilisateur chaleureusement." if premiere else
+                "Tu as déjà présenté des trajets dans cette conversation : fais une phrase courte et "
+                "naturelle, SANS formule d'accueil (pas de « avec plaisir », « bonne nouvelle », « super »), "
+                "qui reconnaît ce qu'il vient de demander (autre mode, autre budget, autre trajet...).")
+    prompt = (f'L\'utilisateur vient de demander : "{message}".\n'
+              f"Tu as trouvé {len(candidats)} option(s). Mode demandé : {mode}. "
+              f"Budget : {contexte.get('budget_fcfa') or 'aucun'}.\n"
+              f"Conditions actuelles (à ne mentionner que si c'est vraiment utile) : {infos_conditions or 'aucune'}\n"
+              f"{consigne}\n"
+              "Écris UNE seule phrase de 25 mots maximum. Ne décris pas les étapes (elles seront écrites "
+              "juste après), ne donne aucun conseil, n'invente rien.")
     try:
-        r = client.chat.completions.create(
-            model=MODEL,
-            messages=_messages_llm(SYSTEME_TRAJET + memoire_txt, prompt, historique),
-            temperature=0.6, max_tokens=140,
-        )
-        texte = (r.choices[0].message.content or "").strip().strip('"').strip()
-        texte = texte.split("\n")[0].strip()
-        texte = _phrase_complete(texte, r.choices[0].finish_reason == "length")
-        return texte or modele
+        r = client.chat.completions.create(model=MODEL, temperature=0.6, max_tokens=140,
+                                           messages=_messages_llm(SYSTEME_TRAJET + memoire_txt, prompt, historique))
+        texte = (r.choices[0].message.content or "").strip().strip('"').strip().split("\n")[0].strip()
+        return _phrase_complete(texte, r.choices[0].finish_reason == "length") or modele
     except Exception as e:
         log.error("erreur intro trajet : %s", e)
         return modele
 
-
-def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, historique: list,
-                    s: dict, memoire_txt: str, infos_conditions: str) -> str:
-    premiere = not s.get("nb_reponses_trajet")
-    budget = contexte.get("budget_fcfa")
-
+def _reponse_trajet(message, contexte, candidats, mode, historique, s, memoire_txt, infos_conditions) -> str:
+    """Réponse quand on présente des trajets : intro + option 1 détaillée + conseils nouveaux."""
+    premiere, budget = not s.get("nb_reponses_trajet"), contexte.get("budget_fcfa")
     if not candidats:
         if _EXCLURE.get():
             return ("Je n'ai pas d'autre trajet vraiment différent entre ces deux lieux. "
                     "Tu veux essayer un autre mode (bus, gbaka, bateau-bus) ?")
         if mode and mode != "TOUS":
-            lib = _LIBELLE_MODE.get(mode, mode.lower())
-            return (f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux. "
-                    f"Tu veux que je cherche en bus, en gbaka ou avec tous les modes ?")
+            return message_aucun_trajet(mode, contexte.get("depart_lieu"), contexte.get("destination_lieu"))
         return ("Je n'ai trouvé aucun trajet pour l'instant. Vérifie ton départ et ta destination, "
                 "ou essaie un autre mode de transport.")
-
     combo = candidats[0].get("combo_mode")
     if combo:
-        lib = _LIBELLE_MODE.get(combo, combo.lower())
+        lib = NOM_MODE.get(combo, combo.lower())
         intro = (f"Je n'ai pas de trajet 100 % {lib} entre ces deux lieux, mais voici des trajets "
                  f"qui combinent le {lib} avec un autre mode.")
     else:
-        intro = _intro_trajet(message, contexte, candidats, mode, historique, premiere,
-                              memoire_txt, infos_conditions)
-
+        intro = _intro_trajet(message, contexte, candidats, mode, historique, premiere, memoire_txt, infos_conditions)
     if budget and extraire_budget(message) == budget:
         intro += f" Tous ces trajets respectent ton budget de {budget} FCFA."
-    parts = [intro, "Option 1 :\n" + decrire_trajet(candidats[0])]
+    position = (candidats[0]["etapes"][0].get("depart_pos") if candidats[0].get("etapes") else None)
+    situe = _situer_sur_trajet(position, s.get("dernieres_options")) if premiere is False else ""
+    parts = [intro] + ([situe] if situe else []) + ["Option 1 :\n" + decrire_trajet(candidats[0])]
     autres = len(candidats) - 1
     if autres > 0:
-        parts.append(f"J'ai aussi {autres} autre{'s' if autres > 1 else ''} option{'s' if autres > 1 else ''} "
-                     f"dans les cartes.")
-
+        parts.append(f"J'ai aussi {autres} autre{'s' if autres > 1 else ''} option{'s' if autres > 1 else ''} dans les cartes.")
     deja = set(s.get("conseils_donnes") or [])
     nouveaux = [(k, t) for k, t in _conseils_liste(candidats, budget) if k not in deja]
-    if nouveaux:
+    if nouveaux:                                       # on ne répète jamais un conseil déjà donné
         parts.append("💡 " + " ".join(t for _, t in nouveaux))
         s["conseils_donnes"] = list(deja | {k for k, _ in nouveaux})
     s["nb_reponses_trajet"] = (s.get("nb_reponses_trajet") or 0) + 1
     return "\n\n".join(parts)
 
+def _situer_sur_trajet(position: dict, options: list) -> str:
+    """Accompagnement : la personne dit où elle est. On regarde si cet endroit est sur le trajet
+    déjà proposé (arrêts en coordonnées GPS) et on lui dit où elle en est."""
+    if not position or not options:
+        return ""
+    meilleur = None
+    for n, e in enumerate([e for e in options[0].get("etapes", []) if e.get("mode") not in ("MARCHE", "WORO_WORO")], 1):
+        points = [(e["depart"], e.get("depart_pos")), (e["arrivee"], e.get("arrivee_pos"))] + \
+                 [(a["nom"], a) for a in e.get("arrets", [])]
+        for nom, p in points:
+            if p and p.get("latitude") is not None:
+                d = distance_m(position["latitude"], position["longitude"], p["latitude"], p["longitude"])
+                if d <= 400 and (not meilleur or d < meilleur[0]):
+                    meilleur = (d, nom, n, e)
+    if not meilleur:
+        return ""
+    d, nom, n, e = meilleur
+    ligne = f"{NOM_MODE.get(e['mode'], '')} {e.get('numero_ligne') or ''}".strip()
+    return (f"Tu es tout près de « {nom} » ({_dist_txt(d)}), sur l'étape {n} de ton trajet ({ligne}) : "
+            f"tu peux la continuer et descendre à « {e['arrivee']} ».")
 
-# accompagnement sur place (Google Maps + réseau local)
-
-_RE_AIDE = re.compile(r"(ne trouve pas|n.?arrive pas|perdu|\bou (est|sont|trouver|se trouve)|c.?est ou|"
-                      r"comment (faire|trouver|rejoindre)|je cherche|quel (bus|gbaka)|je prends quoi|"
-                      r"ou (je )?(descends|descendre|monte|monter|prendre))")
-_RE_POSITION = re.compile(r"(je suis|je me trouve|me voici|arrive[e]? (a|au|aux)|je viens d.?arriv|devant|pres de|a cote de)")
-_RE_NOUVEAU = re.compile(r"(je veux aller|je voudrais aller|pour aller|trajet (pour|de|vers)|itineraire)")
-_RE_LIEU = re.compile(r"(?:suis|trouve|voici|arriv\w*|devant|pr[èe]s d[eu]|c[ôo]t[ée] d[eu])\s+(?:\w+\s+){0,2}?"
-                      r"(?:[àa]|au|aux|devant|vers|chez)\s+(.+?)(?=\s+(?:mais|et|je|j'|comment|o[ùu]|car|donc|pour)\b|[,.;!?]|$)")
-
-
-def _dit_sa_position(message: str, s: dict) -> bool:
-    """« je suis arrêté vers la gare... » alors qu'un trajet a été proposé : l'utilisateur est en chemin."""
-    return bool((s.get("guidage_actif") or s.get("dernieres_options")) and _RE_LIEU.search(message.lower())
-                and not _RE_NOUVEAU.search(nettoyer_texte(message)))
-
-
-def _est_guidage(message: str) -> bool:
-    t = nettoyer_texte(message)
-    return bool(_RE_AIDE.search(t) and _RE_POSITION.search(t) and not _RE_NOUVEAU.search(t))
-
-
-def _direction(lat1, lon1, lat2, lon2) -> str:
-    ang = (math.degrees(math.atan2(lon2 - lon1, lat2 - lat1)) + 360) % 360
-    return ("au nord", "au nord-est", "à l'est", "au sud-est", "au sud",
-            "au sud-ouest", "à l'ouest", "au nord-ouest")[int((ang + 22.5) // 45) % 8]
-
-
-def _chercher_maps(requete: str, lat: float, lon: float, n: int = 4) -> list:
-    cle = ("maps", requete.lower(), round(lat, 3), round(lon, 3))
-    deja = cache_get(cle)
-    if deja is not None:
-        return deja
-    try:
-        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps", "type": "search", "q": requete,
-                              "ll": f"@{lat},{lon},15z", "hl": "fr", "gl": "ci"}).as_dict()
-    except Exception as e:
-        log.warning("recherche maps echouee : %s", e)
-        return []
-    out = []
-    for r in (res.get("local_results") or []) + ([res["place_results"]] if res.get("place_results") else []):
-        c = r.get("gps_coordinates") or {}
-        if c.get("latitude") is None or c.get("longitude") is None:
-            continue
-        out.append({"nom": r.get("title") or "lieu", "adresse": r.get("address") or "",
-                    "latitude": c["latitude"], "longitude": c["longitude"],
-                    "distance_m": int(distance_m(lat, lon, c["latitude"], c["longitude"])),
-                    "direction": _direction(lat, lon, c["latitude"], c["longitude"])})
-    out = sorted(out, key=lambda x: x["distance_m"])[:n]
-    cache_set(cle, out)
-    return out
-
-
-def _itineraire_marche(lat, lon, tlat, tlon, n: int = 6) -> list:
-    """Indications de marche pas à pas (Google Maps Directions) ; [] si indisponible."""
-    cle = ("marche", round(lat, 4), round(lon, 4), round(tlat, 4), round(tlon, 4))
-    deja = cache_get(cle)
-    if deja:
-        return deja
-    try:
-        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps_directions", "travel_mode": 2,
-                              "start_coords": f"{lat},{lon}", "end_coords": f"{tlat},{tlon}",
-                              "hl": "fr", "gl": "ci"}).as_dict()
-        pas = [d for t in ((res.get("directions") or [{}])[0].get("trips") or []) for d in t.get("details", [])]
-    except Exception as e:
-        log.warning("itineraire marche echoue : %s", e)
-        return []
-    out = [f"{d['title'].strip()} ({d.get('formatted_distance', '')})".replace(" ()", "")
-           for d in pas if d.get("title")][:n]
-    if out:
-        cache_set(cle, out)
-    return out
-
-
-def _situer_sur_trajet(c: dict, lat, lon):
-    """Où l'utilisateur en est sur son trajet déjà proposé (arrêts de montée, de passage, de descente)."""
-    etapes = c.get("etapes", [])
-    pts = []
-    for k, e in enumerate(etapes):
-        if e.get("depart_pos"):
-            pts.append((k, "depart", e["depart"], e["depart_pos"]))
-        pts += [(k, "ligne", a["nom"], a) for a in (e.get("arrets") or [])[1:-1]]
-        if e.get("arrivee_pos"):
-            pts.append((k, "arrivee", e["arrivee"], e["arrivee_pos"]))
-    if not pts:
-        return "", None
-    k, role, nom, pos = min(pts, key=lambda x: distance_m(lat, lon, x[3]["latitude"], x[3]["longitude"]))
-    d = distance_m(lat, lon, pos["latitude"], pos["longitude"])
-    if d > 150:
-        return f"Tu n'es sur aucun point de ton trajet initial (le plus proche : « {nom} », à {_dist_txt(d)}).", None
-    e = etapes[k]
-    ligne = f"{_NOM_MODE.get(e['mode'], 'la marche')} {e.get('numero_ligne') or ''}".strip()
-    suivant = next((x for x in etapes[k + (1 if role == "arrivee" else 0):] if x.get("mode") != "MARCHE"), None)
-    if role == "ligne":
-        return f"Tu es sur le parcours {'du ' + ligne[3:] if ligne.startswith('le ') else 'de ' + ligne} de ton trajet, à « {nom} ». Descends à « {e['arrivee']} ».", None
-    if role == "arrivee" and k + 1 >= len(etapes):
-        return f"Tu es arrivé : « {nom} », à {_dist_txt(d)} de ta destination.", None
-    texte = f"Tu es à « {nom} », sur ton trajet initial."
-    if suivant:
-        texte += (f" Prochaine étape : monte dans {_NOM_MODE.get(suivant['mode'], suivant['mode'])} "
-                  f"{suivant.get('numero_ligne') or ''} à « {suivant['depart']} », descends à « {suivant['arrivee']} ».").replace("  ", " ")
-    return texte, None
-
-
-def _arret_par_nom(lieu: str, pres_de=None):
-    """Arrêt du réseau (CSV) qui correspond au lieu dit par l'utilisateur (tous les mots), sinon None."""
-    cible, mots = nettoyer_texte(lieu), _mots_cle(lieu)
-    if not mots:
-        return None
-    notes = [(n, -abs(len(_mots_cle(a["nom"])) - len(mots)), a) for a in RESEAU["arrets"].values()
-             if any(m[:4] in nettoyer_texte(a["nom"]) for m in mots) for n in [_score_nom(cible, a["nom"])]]
-    if not notes or max(n[:2] for n in notes)[0] < 0.99:
-        return None
-    top = max(n[:2] for n in notes)
-    ex = [a for n, k, a in notes if (n, k) == top]
-    return min(ex, key=lambda a: distance_m(pres_de["latitude"], pres_de["longitude"], a["latitude"], a["longitude"])) \
-        if pres_de else ex[0]
-
-
-def _lignes_a_l_arret(sid: str, n: int = 6) -> str:
-    """Lignes du réseau (CSV) qui PARTENT de cet arrêt, avec leur terminus."""
-    out = set()
-    for info in _lignes_passant_par(sid, {"BUS", "GBAKA", "BATEAU"}):
-        seq = info["sequence"]
-        if seq[-1] != sid:
-            out.add(f"{info['ligne']['type'].lower()} {info['ligne'].get('numero') or ''} → "
-                    f"{RESEAU['arrets'].get(seq[-1], {}).get('nom', '?')}".replace("  ", " "))
-    return ", ".join(sorted(out)[:n]) or "aucune ligne enregistrée"
-
-
-def _destination_du_trajet(s: dict):
-    """Destination (nom + coordonnées) du trajet déjà proposé, sinon géocodée."""
-    opts = s.get("dernieres_options") or []
-    if opts and opts[0].get("etapes") and opts[0]["etapes"][-1].get("arrivee_pos"):
-        e = opts[0]["etapes"][-1]
-        return {"nom": s.get("destination") or e["arrivee"], **e["arrivee_pos"]}
-    g = rechercher_lieu(s["destination"]) if s.get("destination") else None
-    return {"nom": s["destination"], "latitude": g["latitude"], "longitude": g["longitude"]} if g else None
-
-
-def _reponse_guidage(message: str, contexte: dict, historique: list, s: dict, memoire_txt: str) -> str:
-    """Accompagnement fondé sur les DONNÉES : l'utilisateur est localisé (arrêt du réseau si le nom correspond,
-    sinon Google Maps), on lui donne les lignes qui partent d'autour de lui et les trajets calculés par le
-    réseau jusqu'à sa destination, en tenant compte du trajet déjà proposé. Rien n'est laissé à l'invention du LLM."""
-    info = s.get("guidage_msg") or {}
-    m = _RE_LIEU.search(message.lower())
-    lieu = info.get("lieu") or (m.group(1).strip() if m else None)
-    gps = (contexte.get("latitude", contexte.get("lat")), contexte.get("longitude", contexte.get("lon")))
-    ancienne = s.get("position")
-    if lieu:
-        a = _arret_par_nom(lieu, ancienne)
-        pos = a
-        if not a:   # un repère (« la pharmacie ») se cherche près de la dernière position connue
-            proche = _chercher_maps(lieu, ancienne["latitude"], ancienne["longitude"], 1) if ancienne else []
-            pos = proche[0] if proche and proche[0]["distance_m"] < 1500 else rechercher_lieu(lieu)
-        if pos:
-            s["position"] = {"nom": a["nom"] if a else lieu, "latitude": pos["latitude"], "longitude": pos["longitude"]}
-    elif gps[0] is not None and gps[1] is not None:
-        s["position"] = {"nom": "ta position GPS", "latitude": gps[0], "longitude": gps[1]}
-    p = s.get("position")
-    if not p:
-        return ("Dis-moi où tu te trouves (quartier, grand repère) ou partage ta position, "
-                "et je te guide pas à pas 😊")
-    lat, lon = p["latitude"], p["longitude"]
-
-    t = nettoyer_texte(message)
-    modes = [mo for mo, mots in (("GBAKA", ("gbaka", "woro", "gare")), ("BUS", ("bus", "sotra", "arret")),
-                                 ("BATEAU", ("bateau", "lagunaire"))) if any(w in t for w in mots)] or None
-    dest = _destination_du_trajet(s)
-    faits = []
-    if info.get("recherche") or _RE_AIDE.search(t) or not dest:
-        proches = arrets_proximite_par_modes(lat, lon, 1500, modes)[:3]
-        if proches:
-            faits.append("Arrêts proches de toi (données MobiGo) :\n" + "\n".join(
-                f"- {a['nom']} ({_dist_txt(a['distance_m'])} {_direction(lat, lon, a['latitude'], a['longitude'])}) : "
-                f"{_lignes_a_l_arret(a['id'])}" for a in proches))
-        else:
-            faits.append("Je n'ai aucun arrêt de ce type dans mes données à moins de 1,5 km.")
-            lieux = _chercher_maps(f"{info.get('recherche') or 'gare gbaka'} {p['nom']}", lat, lon)
-            if lieux:
-                faits.append("Lieux trouvés sur Google Maps, non vérifiés (à confirmer sur place) : " + " ; ".join(
-                    f"{x['nom']} ({_dist_txt(x['distance_m'])} {x['direction']})" for x in lieux))
-    if dest and distance_m(lat, lon, dest["latitude"], dest["longitude"]) < 150:
-        faits.append(f"Tu es arrivé : « {dest['nom']} » est à moins de 150 m.")
-    elif dest:
-        cands = choisir_propositions(candidats_multimodaux(
-            {"nom": p["nom"], "latitude": lat, "longitude": lon}, dest, "TOUS"), maxi=2)
-        if cands:
-            faits.append(f"Depuis « {p['nom']} », trajets du réseau pour rejoindre « {dest['nom']} » :\n" + "\n\n".join(
-                f"Option {k} :\n{decrire_trajet(c)}" for k, c in enumerate(cands, 1)))
-            e0 = cands[0]["etapes"][0]
-            if e0["mode"] == "MARCHE" and e0.get("distance_m", 0) > 100:
-                pas = _itineraire_marche(lat, lon, e0["arrivee_pos"]["latitude"], e0["arrivee_pos"]["longitude"])
-                if pas:
-                    faits.append(f"Pour rejoindre l'arrêt « {e0['arrivee']} » (indications Google Maps) : " + " > ".join(pas))
-        else:
-            faits.append(f"Je ne trouve aucun trajet du réseau depuis ici vers « {dest['nom']} ».")
-    if s.get("dernieres_options"):
-        situation, _ = _situer_sur_trajet(s["dernieres_options"][0], lat, lon)
-        if situation:
-            faits.append(situation)
-    bloc = f"📍 Je te situe à « {p['nom']} ».\n\n" + "\n\n".join(faits)
-    s["guidage_contexte"] = bloc[:1800]
-
-    if not client:
-        return bloc
-    prompt = (f"{message}\n\n[Faits vérifiés (données MobiGo) :\n{bloc}]\n"
-              "Réponds en 2 phrases maximum à ce que l'utilisateur vient de dire ou de demander, en t'appuyant "
-              "UNIQUEMENT sur ces faits. N'écris ni itinéraire, ni direction, ni nom de rue ou de lieu absent des "
-              "faits : le détail des étapes est ajouté automatiquement après ta réponse. Si on te demande de "
-              "confirmer un lieu qui n'est pas dans les faits, dis simplement que tu ne l'as pas dans tes données. "
-              "Les gares de gbaka sont souvent informelles : invite à confirmer sur place auprès des apprentis.")
-    try:
-        r = client.chat.completions.create(model=MODEL, messages=_messages_llm(SYSTEME_AMI + memoire_txt, prompt, historique),
-                                           temperature=0.3, max_tokens=150)
-        lead = _phrase_complete(r.choices[0].message.content, r.choices[0].finish_reason == "length")
-        return (lead + "\n\n" if lead else "") + bloc
-    except Exception as e:
-        log.error("erreur guidage : %s", e)
-        return bloc
-
-
-#  generer_reponse — naturel, sans répétition 
-def generer_reponse(message: str, contexte: dict, historique: list = None,
-                    session_id: str = None) -> str:
-    historique = historique or []
-    statut = contexte.get("statut", "")
-    candidats = contexte.get("candidats") or []
-    mode = contexte.get("mode", "TOUS")
+def generer_reponse(message: str, contexte: dict, historique: list = None, session_id: str = None) -> str:
+    """Réponse finale de MobiGuide selon le statut : TRAJET, SUIVI (question sur un trajet) ou CONVERSATION."""
+    historique, statut = historique or [], contexte.get("statut", "")
+    candidats, mode = contexte.get("candidats") or [], contexte.get("mode", "TOUS")
     s = SESSIONS[session_id] if session_id else {}
-
     infos_conditions = _extraire_infos_conditions(contexte)
-    question_conditions = _est_question_conditions(message)
-
     memoire_txt = ""
-    if session_id and session_id in SESSIONS:
-        if s.get("depart") or s.get("destination"):
-            memoire_txt = (f"\nContexte de la discussion : départ={s.get('depart')}, "
-                           f"destination={s.get('destination')}, "
-                           f"budget={s.get('budget_fcfa') or 'aucun'}, "
-                           f"mode={s.get('mode_transport') or 'non précisé'}")
-
-    if s.get("guidage_contexte"):
-        memoire_txt += ("\nL'utilisateur est en train d'être guidé sur place. Dernières infos trouvées pour lui "
-                        f"(continue à le guider avec elles) : {s['guidage_contexte']}\n"
-                        "Ne cite AUCUN lieu, arrêt, rue, carrefour ou ligne qui n'est pas dans ces infos ; si on te "
-                        "demande de confirmer un lieu absent de ces infos, dis que tu ne l'as pas dans tes données.")
-    if statut != "TRAJET" and (s.get("guidage_msg") is not None or _est_guidage(message)):
-        return _reponse_guidage(message, contexte, historique, s, memoire_txt)
-
+    if session_id and (s.get("depart") or s.get("destination")):
+        memoire_txt = (f"\nContexte de la discussion : départ={s.get('depart')}, destination={s.get('destination')}, "
+                       f"budget={s.get('budget_fcfa') or 'aucun'}, mode={s.get('mode_transport') or 'non précisé'}")
     if statut == "TRAJET":
-        return _reponse_trajet(message, contexte, candidats, mode, historique, s,
-                               memoire_txt, infos_conditions)
-
+        return _reponse_trajet(message, contexte, candidats, mode, historique, s, memoire_txt, infos_conditions)
     if not client:
-        if statut == "CONVERSATION":
-            return ("Bonjour ! 😊 Je suis MobiGuide, ton guide à Abidjan. "
-                    "Dis-moi où tu veux aller et je te propose le meilleur trajet !")
-        return ("Je suis MobiGuide. Dis-moi ton point de départ et ta destination, "
-                "et je m'occupe du reste 😊")
-
+        return ("Bonjour ! 😊 Je suis MobiGuide, ton guide à Abidjan. Dis-moi où tu veux aller et je te propose le meilleur trajet !"
+                if statut == "CONVERSATION" else
+                "Je suis MobiGuide. Dis-moi ton point de départ et ta destination, et je m'occupe du reste 😊")
+    prompt = message
     if statut == "SUIVI":
-        systeme = SYSTEME_AMI + memoire_txt
-        resume = "\n".join(
-            f"- {c.get('libelle', 'proposition')} : {c.get('duree_minutes', '?')} min, "
-            f"prix {_prix_texte(c)}, {c.get('nb_correspondances', 0)} correspondance(s), "
-            f"{c.get('marche_m', 0)} m de marche ; {_points_cles(c)}"
-            for c in candidats)
+        resume = "\n".join(f"- {c.get('libelle', 'proposition')} : {c.get('duree_minutes', '?')} min, "
+                           f"prix {_prix_texte(c)}, {c.get('nb_correspondances', 0)} correspondance(s), "
+                           f"{c.get('marche_m', 0)} m de marche ; {_points_cles(c)}" for c in candidats)
         prompt = f"""{message}
 
 [Trajets que tu viens de proposer à l'utilisateur (cartes déjà affichées) :
@@ -3414,34 +1963,27 @@ Conditions actuelles : {infos_conditions}]
 Réponds directement à SA question, en 2-3 phrases, avec ces infos, sur un ton chaleureux.
 Ne répète pas les conseils ni l'accueil déjà donnés plus haut dans la conversation. N'ajoute un conseil
 que s'il est nouveau et vraiment utile. Ne recopie pas tout l'itinéraire, n'invente rien."""
-    elif statut == "CONVERSATION":
-        systeme = SYSTEME_AMI + memoire_txt
-        if question_conditions:
-            prompt = f"""{message}
+    elif statut == "CONVERSATION" and _est_question_conditions(message):
+        prompt = f"""{message}
 
 [Infos pour répondre : conditions actuelles calculées par notre modèle ML : {infos_conditions}]
 Utilise UNIQUEMENT ces infos pour trafic / météo, ne renvoie jamais vers Google Maps ou Waze,
 donne un conseil concret en 2-3 phrases maximum."""
-        else:
-            prompt = f"""{message}
+    elif statut == "CONVERSATION":
+        prompt = f"""{message}
 
 Réponds directement et naturellement à ce message, comme un ami chaleureux, en 2 ou 3 phrases maximum.
 Si on te demande ton nom ou qui tu es : tu es MobiGuide, l'assistant de l'application MobiGo pour se déplacer à Abidjan.
 Pour une question hors transport (culture générale, blague, conseil...), réponds-y vraiment ; ne dis jamais que tu
 ne réponds pas à ce genre de questions. Termine, quand c'est naturel, par une courte invitation à t'aider pour un trajet
 (sans imposer de position ni d'itinéraire). Ne répète pas ce que tu as déjà dit."""
-    else:
-        systeme = SYSTEME_AMI + memoire_txt
-        prompt = message
-
     try:
-        reponse = client.chat.completions.create(
-            model=MODEL,
-            messages=_messages_llm(systeme, prompt, historique),
-            temperature=0.5, max_tokens=600,
-        )
-        return _phrase_complete(reponse.choices[0].message.content,
-                                reponse.choices[0].finish_reason == "length")
+        r = client.chat.completions.create(model=MODEL, temperature=0.5, max_tokens=600,
+                                           messages=_messages_llm(SYSTEME_AMI + memoire_txt, prompt, historique))
+        return _phrase_complete(r.choices[0].message.content, r.choices[0].finish_reason == "length")
     except Exception as e:
         log.error("erreur generation reponse : %s", e)
         return "Je suis MobiGuide. Dis-moi où tu veux aller et je te propose un trajet."
+
+
+choisir_options = choisir_propositions    # ancien nom utilisé par main.py
