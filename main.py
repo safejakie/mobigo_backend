@@ -42,9 +42,8 @@ from ml_mobigo import (
 )
 charger_modele()
 
-# ⚠️ La ligne "import memoire" a été retirée.
 
-app = FastAPI(title="MobiGo API", version="2.4.0") # Version mise à jour
+app = FastAPI(title="MobiGo API", version="2.4.0") 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -358,12 +357,9 @@ def construire_contexte_session(session_id: str, demande) -> dict:
 def assistant_chat(demande: Demande):
     session_id = demande.session_id or "default"
     
-    # ⚠️ Le bloc de restauration de la base de données a été retiré.
-    # L'historique vient directement de Flutter (demande.historique).
     
     message = _separer_contexte(demande.message.strip(), session_id, demande.contexte)
     
-    # ⚠️ La sauvegarde du message utilisateur dans la base a été retirée.
     
     analyse = analyser_intention(message, demande.historique, session_id=session_id)
     intention = analyse["intention"]
@@ -373,12 +369,11 @@ def assistant_chat(demande: Demande):
              intention, mode_transport, analyse.get("mode_precise"))
 
     def repondre(texte: str, **kw) -> ChatResponse:
-        # ⚠️ La sauvegarde de la réponse dans la base et de la session a été retirée.
         return ChatResponse(demande=message, intention=kw.pop("intention", intention),
                             reponse=texte,
                             contexte=_contexte_reponse(session_id), **kw)
 
-    # ── CONVERSATION ─────────────────────────────────────────────
+    # CONVERSATION 
     if intention in ("CONVERSATION", "INCONNUE"):
         contexte_ml = {}
         if _est_question_conditions(message):
@@ -402,7 +397,7 @@ def assistant_chat(demande: Demande):
             intention="CONVERSATION",
         )
 
-    # ── SUIVI ────────────────────────────────────────────────────
+    # SUIVI 
     if intention == "SUIVI":
         s = SESSIONS[session_id]
         contexte_ml = {}

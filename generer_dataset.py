@@ -1,13 +1,3 @@
-"""
-Génère un dataset d'entraînement à partir du GeoJSON des rues d'Abidjan.
-
-Budget SerpAPI : 80 appels max (sous le plafond de 100).
-Stratégie : 1 appel Google Maps par paire, puis 4 contextes simulés
-(matin/midi/soir/nuit × pluie) avec ajustement documenté.
-
-Usage :
-    python generer_dataset.py --n_pairs 80
-"""
 import argparse
 import csv
 import json
@@ -152,7 +142,7 @@ def traiter_paire(o, d, idx, total, writer):
     global _compteur_appels, _echecs_consecutifs
 
     if _compteur_appels >= LIMITE_APPELS:
-        print(f"\n⛔ Limite de {LIMITE_APPELS} appels atteinte. Arrêt.")
+        print(f"\n Limite de {LIMITE_APPELS} appels atteinte. Arrêt.")
         return -1
 
     o_lat, o_lon = o
@@ -168,11 +158,11 @@ def traiter_paire(o, d, idx, total, writer):
     try:
         candidats = services.construire_candidats(dep, dest)
     except Exception as e:
-        print(f"  ❌ Erreur construire_candidats : {type(e).__name__}: {e}")
+        print(f" Erreur construire_candidats : {type(e).__name__}: {e}")
         return 0
 
     if not candidats:
-        print("  ❌ Aucun itinéraire (pas d'appel SerpAPI)")
+        print(" Aucun itinéraire (pas d'appel SerpAPI)")
         return 0
 
     print(f"  ✅ {len(candidats)} candidats")
@@ -181,19 +171,19 @@ def traiter_paire(o, d, idx, total, writer):
     try:
         google_min, appel_reel = google_avec_cache(dep, dest)
     except RuntimeError as e:
-        print(f"  ❌ {e}")
+        print(f" {e}")
         _echecs_consecutifs += 1
         if _echecs_consecutifs >= MAX_ECHECS_CONSECUTIFS:
-            print(f"  ⛔ {_echecs_consecutifs} échecs consécutifs. "
+            print(f" {_echecs_consecutifs} échecs consécutifs. "
                   f"Vérifiez la config SerpAPI dans ml_mobigo.py. Arrêt.")
             return -1
         return 0
 
     if google_min is None:
         _echecs_consecutifs += 1
-        print(f"  ⚠️  SerpAPI indisponible ({_echecs_consecutifs}/{MAX_ECHECS_CONSECUTIFS})")
+        print(f" SerpAPI indisponible ({_echecs_consecutifs}/{MAX_ECHECS_CONSECUTIFS})")
         if _echecs_consecutifs >= MAX_ECHECS_CONSECUTIFS:
-            print(f"  ⛔ Arrêt après {_echecs_consecutifs} échecs consécutifs.")
+            print(f"   Arrêt après {_echecs_consecutifs} échecs consécutifs.")
             return -1
         return 0
 
@@ -201,7 +191,7 @@ def traiter_paire(o, d, idx, total, writer):
     if appel_reel:
         _compteur_appels += 1
 
-    print(f"  🌐 Google Maps : {google_min:.1f} min "
+    print(f"   Google Maps : {google_min:.1f} min "
           f"({_compteur_appels}/{LIMITE_APPELS} appels)")
 
     lignes = 0
@@ -218,7 +208,7 @@ def traiter_paire(o, d, idx, total, writer):
             writer.writerow(row)
             lignes += 1
 
-    print(f"  💾 {lignes} lignes ({len(candidats)} cand. × 4 ctx)")
+    print(f"   {lignes} lignes ({len(candidats)} cand. × 4 ctx)")
     return lignes
 
 
@@ -236,20 +226,20 @@ def main():
     args = parser.parse_args()
 
     if args.n_pairs > LIMITE_APPELS:
-        print(f"⚠️  {args.n_pairs} > {LIMITE_APPELS}. On réduit à {LIMITE_APPELS}.")
+        print(f"  {args.n_pairs} > {LIMITE_APPELS}. On réduit à {LIMITE_APPELS}.")
         args.n_pairs = LIMITE_APPELS
 
     random.seed(args.seed)
 
-    print("📂 Chargement GeoJSON...")
+    print(" Chargement GeoJSON...")
     points = charger_geojson(args.geojson)
     print(f"   {len(points)} points extraits")
 
-    print(f"\n🎯 Échantillonnage : {args.n_points} points (min 1 km)")
+    print(f"\n Échantillonnage : {args.n_points} points (min 1 km)")
     pool = echantillonner_points(points, args.n_points, 1.0)
     print(f"   {len(pool)} points retenus")
 
-    print(f"\n🎲 Génération : {args.n_pairs} paires "
+    print(f"\n Génération : {args.n_pairs} paires "
           f"({args.dist_min_km}-{args.dist_max_km} km)")
     paires = generer_paires(pool, args.n_pairs, args.dist_min_km, args.dist_max_km)
     print(f"   {len(paires)} paires valides")
@@ -257,7 +247,7 @@ def main():
     chemin = Path(args.output)
     if chemin.exists():
         chemin.unlink()
-        print(f"   🗑️  Ancien {chemin} supprimé")
+        print(f"    Ancien {chemin} supprimé")
 
     total_lignes = 0
     t0 = time.time()
@@ -276,14 +266,14 @@ def main():
                 time.sleep(args.pause)
         except KeyboardInterrupt:
             interruption = True
-            print("\n\n⏸️  Interruption manuelle (Ctrl+C). Sauvegarde en cours...")
+            print("\n\n  Interruption manuelle (Ctrl+C). Sauvegarde en cours...")
 
     duree = time.time() - t0
     print(f"\n{'='*55}")
     if interruption:
-        print(f"⏸️  Interrompu après {duree:.1f}s")
+        print(f"  Interrompu après {duree:.1f}s")
     else:
-        print(f"✅ Terminé en {duree:.1f}s")
+        print(f" Terminé en {duree:.1f}s")
     print(f"   Lignes dans {chemin} : {total_lignes}")
     print(f"   Appels SerpAPI consommés : {_compteur_appels}")
     print(f"   Durées Google en cache : {len(_cache_google)}")

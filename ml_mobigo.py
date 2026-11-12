@@ -12,9 +12,7 @@ import serpapi
 from config import SERPAPI_KEY, OPENWEATHER_API_KEY, log
 
 
-# ══════════════════════════════════════════════════════════
 # CONSTANTES
-# ══════════════════════════════════════════════════════════
 OPENWEATHER_KEY = OPENWEATHER_API_KEY
 
 MODES = ["BUS", "GBAKA", "BATEAU", "WORO_WORO"]
@@ -34,9 +32,7 @@ CHEMIN_DATASET = "dataset.csv"
 CHEMIN_MODELE = os.path.join("models", "duration_rf.pkl")
 
 
-# ══════════════════════════════════════════════════════════
 # CONTEXTE TEMPS RÉEL
-# ══════════════════════════════════════════════════════════
 
 def get_meteo(lat: float, lon: float) -> dict:
     if not OPENWEATHER_KEY:
@@ -96,10 +92,7 @@ def construire_contexte(origine: dict, destination: dict) -> dict:
         ),
     }
 
-
-# ══════════════════════════════════════════════════════════
 # FEATURES
-# ══════════════════════════════════════════════════════════
 
 def extraire_features(candidat: dict, contexte: dict) -> dict:
     modes_count = {m: 0 for m in MODES}
@@ -168,9 +161,7 @@ def calculer_cible(candidat: dict, google_min: float,
     return candidat.get("duree_minutes", 0) * max(facteur, 0.5)
 
 
-# ══════════════════════════════════════════════════════════
-# SERPAPI (Version 1.2.0)
-# ══════════════════════════════════════════════════════════
+# SERPAPI
 
 def _extraire_duree_min(directions):
     if not directions:
@@ -223,9 +214,7 @@ def get_google_duration(origine: dict, destination: dict,
     return _extraire_duree_min(res.get("directions"))
 
 
-# ══════════════════════════════════════════════════════════
 # COLLECTE
-# ══════════════════════════════════════════════════════════
 
 def collecter(origine, destination, candidats, contexte, google_min=None):
     if not candidats:
@@ -252,9 +241,7 @@ def collecter(origine, destination, candidats, contexte, google_min=None):
              len(candidats), google_min)
 
 
-# ══════════════════════════════════════════════════════════
 # PRÉDICTEUR
-# ══════════════════════════════════════════════════════════
 
 _model_package = None
 
@@ -263,9 +250,9 @@ def charger():
     if os.path.exists(CHEMIN_MODELE):
         _model_package = joblib.load(CHEMIN_MODELE)
         mae = _model_package.get("mae_test", "?")
-        print(f"✅ Modèle chargé ({CHEMIN_MODELE}) — MAE test = {mae} min")
+        print(f" Modèle chargé ({CHEMIN_MODELE}) — MAE test = {mae} min")
     else:
-        print("⚠️  Pas de modèle. L'agent utilise la durée théorique.")
+        print(" Pas de modèle. L'agent utilise la durée théorique.")
 
 def predire_duree(candidat: dict, contexte: dict):
     if _model_package is None:

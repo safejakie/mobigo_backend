@@ -1,13 +1,3 @@
-"""
-MOBIGO — Entraînement du modèle de prédiction de durée
-======================================================
-Couvre les 5 critères du bloc 2 de la soutenance :
-  2.1 Problème ML       → Section [2.1]
-  2.2 Préparation données → Section [2.2]
-  2.3 Choix et entraînement → Section [2.3]
-  2.4 Évaluation        → Section [2.4]
-  2.5 Amélioration      → Section [2.5]
-"""
 import os
 import warnings
 from datetime import datetime
@@ -143,7 +133,7 @@ def tracer(y_test, pred_base, pred_model):
         plt.savefig("rapport_performance.png", dpi=120)
         print("\n  ➜ Graphiques : rapport_performance.png")
     except Exception as e:
-        print(f"\n  ⚠️  Graphiques : {e}")
+        print(f"\n Graphiques : {e}")
 
 
 def main():
@@ -160,7 +150,7 @@ def main():
 
     df = charger_et_nettoyer(localiser_dataset())
     if len(df) < 100:
-        print(f"\n⚠️  {len(df)} lignes seulement. "
+        print(f"\n  {len(df)} lignes seulement. "
               f"Lance plus de paires dans generer_dataset.py.")
 
     X, y = df[FEATURES], df[CIBLE]
@@ -230,7 +220,7 @@ def main():
         "trained_at": datetime.now().isoformat(),
     }, CHEMIN_MODELE)
         # ... (fin de la fonction main)
-    print(f"\n✅ Modèle sauvegardé : {CHEMIN_MODELE}")
+    print(f"\n Modèle sauvegardé : {CHEMIN_MODELE}")
 
     print("\n" + "=" * 60)
     print(" TERMINÉ — copie le .pkl dans models/ et redémarre l'API")

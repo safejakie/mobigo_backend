@@ -1,4 +1,3 @@
-"""configuration mobigo"""
 import csv
 import io
 import json
@@ -37,7 +36,7 @@ LON_MIN, LON_MAX = -4.25, -3.75
 CENTRE_ABIDJAN = "@5.3364,-4.0267,12z"
 TIMEZONE = "Africa/Abidjan"
 
-# Le Flutter ajoute le « contexte mémorisé » (JSON) au message : 300 était trop court
+# ajout du contexte mémorisé (JSON) au message 
 MAX_MESSAGE = 1200
 RATE_LIMIT = 20
 CACHE_TTL = 60 * 60 * 24
@@ -48,9 +47,6 @@ MAX_TRANSFERTS = 1
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# AUCUN prix en dur : les prix viennent uniquement de bus.csv et bateau_bus.csv.
-# Gbaka / woro-woro : pas de prix (il varie selon le chauffeur ou l'apprenti).
-# Ces dictionnaires restent vides pour ne pas casser d'éventuels imports.
 PRIX_LIGNES = {}
 PRIX_TRAJETS = {}
 PRIX_POUR_CLASSEMENT = {}
