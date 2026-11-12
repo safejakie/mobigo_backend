@@ -1558,7 +1558,9 @@ def _grille_correspondance():
 
 
 def _arrets_proches_de(sid: str, rayon_m: float = 300) -> list:
-    a = RESEAU["arrets"][sid]
+    a = RESEAU["arrets"].get(sid)
+    if not a:   # identifiant présent dans une ligne mais absent des arrêts (données incomplètes)
+        return []
     grille = _grille_correspondance()
     ci, cj = _cellule(a["latitude"], a["longitude"], 0.003)
     res, n = [], int(rayon_m // 330) + 1
@@ -1745,7 +1747,12 @@ def _score_trajet(c: dict) -> int:
 def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
     out, vus = [], set()
     for rayon in (1500, 2500, 4000):
-        for c in _construire_candidats_rayon(dep, dest, mode_filtre, prix_max_ligne, rayon):
+        try:
+            resultats = _construire_candidats_rayon(dep, dest, mode_filtre, prix_max_ligne, rayon)
+        except Exception:   # un rayon qui échoue ne doit pas faire échouer toute la requête
+            log.exception("routage en échec (rayon=%s)", rayon)
+            continue
+        for c in resultats:
             if _signature_candidat(c) not in vus:
                 vus.add(_signature_candidat(c))
                 out.append(c)
@@ -1996,7 +2003,10 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
     candidats.extend(meilleur_corr.values())
 
     if not any(_trajet_correct(c) for c in candidats):
-        candidats.extend(_candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, prix_max_ligne))
+        try:
+            candidats.extend(_candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, prix_max_ligne))
+        except Exception:
+            log.exception("recherche à deux correspondances en échec")
 
     if not candidats:
         for c in CATALOGUE:
