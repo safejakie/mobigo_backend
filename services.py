@@ -20,7 +20,7 @@ from config import (
     cache_get, cache_set, distance_m, log,
 )
 
-# RÉGLAGES (on les change ici, à un seul endroit)
+# RÉGLAGES (on les change ici, à un seul endroit) 
 DESCENTE_MAX_M = 1000          # on descend à 1000 m maximum de la destination
 DESCENTE_MAX_GBAKA_M = 500     # un gbaka dépose plus près (500 m)
 RAYON_DEPART_M = 1500          # on cherche les arrêts de départ dans ce rayon
@@ -80,7 +80,7 @@ def est_gare(nom: str) -> bool:
     """Vrai si le nom parle d'une gare (« gare d'Adjamé », « Adjamé gare »...)."""
     return "gare" in nettoyer_texte(nom or "")
 
-# ── 2. LIEUX : Google Maps (SerpAPI) d'abord, nos arrêts locaux en secours ──
+# 2. LIEUX : Google Maps (SerpAPI) d'abord, nos arrêts locaux en secours 
 def _dans_abidjan(lat, lon) -> bool:
     return ABIDJAN_LAT[0] <= lat <= ABIDJAN_LAT[1] and ABIDJAN_LON[0] <= lon <= ABIDJAN_LON[1]
 
@@ -152,7 +152,9 @@ def rechercher_lieu(lieu: Optional[str]):
     return resultat
 
 def suggestions_lieu(lieu: str, limite: int = 8) -> list:
-    """Liste de suggestions pendant que l'utilisateur tape (arrêts locaux, puis Google Maps)."""
+    """Suggestions pendant que l'utilisateur tape. Ordre : 1) nos arrêts qui contiennent TOUS les mots,
+    2) les vrais lieux de Google Maps (ex : « Université Félix Houphouët-Boigny »), 3) arrêts avec au moins
+    un mot. (Avant, les arrêts « Cocody » remplissaient les 8 places et Google n'était jamais interrogé.)"""
     lieu = (lieu or "").strip()
     if len(lieu) < 2:
         return []
@@ -162,25 +164,29 @@ def suggestions_lieu(lieu: str, limite: int = 8) -> list:
         return deja
     if not RESEAU["charge"]:
         charger_reseau_local()
-    resultats, vus = [], set()
-    texte = nettoyer_texte(lieu)
+    mots = extraire_mots(lieu)
+    tous_mots, un_mot, vus = [], [], set()
     for a in RESEAU["arrets"].values():
         if a["id"] in RESEAU["points_libres"] or a["nom"] in vus:
             continue
         nom = nettoyer_texte(a["nom"])
-        if texte in nom or any(m in nom for m in texte.split() if len(m) > 3):
+        fiche = {"nom": a["nom"], "adresse": "", "latitude": a["latitude"], "longitude": a["longitude"]}
+        if mots and all(m in nom for m in mots):
             vus.add(a["nom"])
-            resultats.append({"nom": a["nom"], "adresse": "", "latitude": a["latitude"],
-                              "longitude": a["longitude"]})
-            if len(resultats) >= limite:
-                break
-    if len(resultats) < limite:
-        for t in _google_maps(f"{lieu}, Abidjan, Côte d'Ivoire"):
-            if t["nom"] not in vus and len(resultats) < limite:
-                vus.add(t["nom"])
-                resultats.append(t)
+            tous_mots.append(fiche)
+        elif any(m in nom for m in mots if len(m) > 3):
+            vus.add(a["nom"])
+            un_mot.append(fiche)
+    resultats = tous_mots[:4]
+    for t in _google_maps(f"{lieu}, Abidjan, Côte d'Ivoire"):
+        if t["nom"] not in vus and len(resultats) < limite:
+            vus.add(t["nom"])
+            resultats.append(t)
+    resultats += tous_mots[4:] + un_mot
+    resultats = resultats[:limite]
     cache_set(cle, resultats)
     return resultats
+
 
 MOTS_POSITION = ("position", "ici", "je suis la", "je suis ici", "pres de moi", "autour de moi",
                  "chez moi", "mon emplacement", "ma localisation", "localisation")
@@ -200,7 +206,7 @@ def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon
             return lieu
     return ma_position if a_gps else None
 
-#  3. DONNÉES : chargement des fichiers CSV 
+# 3. DONNÉES : chargement des fichiers CSV 
 CATALOGUE = []                 # une entrée par ligne (bus, bateau, gbaka/woro)
 RESEAU = {
     "arrets": {},              # id -> {id, nom, latitude, longitude}
@@ -285,7 +291,7 @@ def charger_catalogue():
         CATALOGUE.append(e)
     log.info("catalogue charge : %d lignes", len(CATALOGUE))
 
-#  4. PETITS CALCULS SUR LA CARTE 
+# 4. Petits calculs sur la carte 
 def _dist_rapide(lat1, lon1, lat2, lon2) -> float:
     """Distance approximative en mètres (rapide, assez juste à Abidjan)."""
     dy = (lat1 - lat2) * 111320.0
@@ -319,7 +325,7 @@ def _point_proche_du_trace(lat, lon, trace, bbox, seuil_m=300) -> bool:
         return False
     return any(distance_m(lat, lon, tl, tn) <= seuil_m for tl, tn in trace)
 
-#  5. SÉQUENCES D'ARRÊTS : DANS QUEL ORDRE UNE LIGNE PASSE PAR SES ARRÊTS 
+# ── Séquences d'arrêts : dans quel ordre une ligne passe par ses arrêts ─────
 def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
     """Liste ordonnée des arrêts situés à moins de seuil_m du tracé (sans doublons proches)."""
     passages = defaultdict(list)                       # arrêt -> [(position sur le tracé, distance)]
@@ -340,7 +346,7 @@ def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
             groupe = [h] if h else []
     evenements.sort()
     gardes = []
-    for _, sid in evenements:                          
+    for _, sid in evenements:                         
         a = RESEAU["arrets"][sid]
         nom = nettoyer_texte(a["nom"])
         if not any(nettoyer_texte(RESEAU["arrets"][b]["nom"]) == nom and _dist_rapide(
@@ -646,7 +652,7 @@ def lignes_par_arret(stop_id: str) -> Optional[dict]:
     lignes.sort(key=lambda l: (0 if l["type"] == "BUS" else 1, l["numero"] or "zzz"))
     return {"arret": arret, "lignes": lignes}
 
-# 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS
+# ── 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS ──
 PRIX_CATALOGUE = {}            # (mode, numéro de ligne) -> prix lu dans le CSV
 
 def _norm_num(n) -> str:
@@ -784,7 +790,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
     cands = courtes or cands
 
     def cle(c):                                        # plus petit = meilleur
-        base = c.get("nb_arrets", 0) + _acces_m(c) / 200.0
+        base = c.get("nb_arrets", 0) + _acces_m(c) / 80.0     # 80 m à pied = 1 min = environ 1 arrêt en bus
         corr, duree = c.get("nb_correspondances", 0), c.get("duree_minutes", 999)
         if priorite == "prix":
             return (corr, c.get("cout_partiel_fcfa", 0), base, duree)
@@ -844,7 +850,8 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         for autre in g[1:]:
             ta = _etapes_transport(autre)[-1]
             nom = _nom_court_ligne(ta)
-            if nom in vus or ta.get("mode") != derniere.get("mode") or ta["arrivee"] != derniere["arrivee"]:
+            if nom in vus or ta.get("mode") != derniere.get("mode") or ta["arrivee"] != derniere["arrivee"] \
+                    or ta["depart"] != derniere["depart"]:
                 continue
             vus.add(nom)
             alternatives.append({"ligne": nom, "mode": ta["mode"], "nb_arrets": ta.get("nb_arrets", 0)})
@@ -858,7 +865,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         resultat.append(rep)
     return resultat
 
-# ── 6. CONSTRUCTION DES TRAJETS ──
+# 6. CONSTRUCTION DES TRAJETS
 @functools.lru_cache(maxsize=None)
 def _arrets_proches_de(sid: str, rayon_m: float = 300) -> tuple:
     """Arrêts à moins de rayon_m d'un arrêt donné (pour les correspondances à pied)."""
@@ -1303,7 +1310,7 @@ def arrets_proches_trajet(dep: dict, dest: dict, mode_filtre: str = "TOUS", rayo
             "arrivee": arrets_proximite_par_modes(dest["latitude"], dest["longitude"], rayon_m, modes)[:5]}
 
 
-# 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche)
+# ── 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche) ──
 def prix_connu(mode, nom_ligne, montee, descente, numero):
     if numero and str(numero) in PRIX_LIGNES:
         return PRIX_LIGNES[str(numero)]
@@ -1432,7 +1439,7 @@ def _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero) -> lis
     if not cands:
         return []
 
-    def repere(nom):                                 
+    def repere(nom):                                   # l'arrêt qui porte le nom de l'origine / destination
         meilleur, sc = None, 0.5
         for sq in cands:
             for sid in sq:
@@ -1557,7 +1564,7 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if attente_mode is not None:
         s["attente_mode"] = attente_mode
         if attente_mode:
-            s["mode_demande"] = True                  
+            s["mode_demande"] = True                   # la question « quel mode ? » n'est posée qu'une fois
 
 def extraire_budget(texte: str) -> Optional[int]:
     """Comprend « j'ai 400 », « 400 balles », « moins de 300 », « 2 mille », « 1 500 francs »..."""
@@ -1726,7 +1733,7 @@ Règles :
         log.error("erreur analyse intention : %s", e)
     return _completer_analyse({"intention": "INCONNUE"}, s, mode_msg, budget_msg)
 
-# Textes de réponse
+# Textes de réponse 
 SYSTEME_AMI = (
     "Tu es MobiGuide, un assistant sympa basé à Abidjan. Tu discutes naturellement, comme un ami : "
     "tu réponds à toutes les questions (pas seulement les transports), en français, de façon courte "
