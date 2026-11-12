@@ -1824,27 +1824,20 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         modes = {"BATEAU"}
 
     arrets_dep_proximite = arrets_proximite(dep["latitude"], dep["longitude"], rayon, True, par_nom=False)
-    arrets_dep = []
-    modes_depart_vus = set()
-    for arret in arrets_dep_proximite:
-        modes_arret = {
-            RESEAU["lignes"].get(rid, {}).get("type")
-            for rid in RESEAU["lignes_par_arret"].get(arret["id"], [])
-        } & modes
-        if not modes_arret - modes_depart_vus:
-            continue
-        arrets_dep.append(arret)
-        modes_depart_vus.update(modes_arret)
-
-    # arrêts « jumeaux » (même nom, <300 m, autre côté de la route) : leurs lignes comptent aussi au départ
-    base = list(arrets_dep)
-    arrets_dep += [b for b in arrets_dep_proximite if b not in base and any(
-        nettoyer_texte(b["nom"]) == nettoyer_texte(a["nom"])
-        and _dist_rapide(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) <= 300 for a in base)]
+    # Garder tous les arrêts valides du rayon, triés par distance. L'ancien
+    # filtre ne gardait que le premier arrêt de chaque mode et pouvait éliminer
+    # la ligne réellement la plus proche de l'utilisateur.
+    arrets_dep = [a for a in arrets_dep_proximite if any(
+        RESEAU["lignes"].get(rid, {}).get("type") in modes
+        for rid in RESEAU["lignes_par_arret"].get(a["id"], []))]
 
     arret_depart_prioritaire = arrets_dep[0] if arrets_dep else None
     arrets_arr_proximite = arrets_proximite(dest["latitude"], dest["longitude"], rayon, True, par_nom=False)
-    arrets_arr = _arrets_utiles(arrets_arr_proximite, modes)
+    # Inclure tous les arrêts valides près de la destination, du plus proche au
+    # plus éloigné, pour que les descentes proches ne soient pas écartées.
+    arrets_arr = [a for a in arrets_arr_proximite if any(
+        RESEAU["lignes"].get(rid, {}).get("type") in modes
+        for rid in RESEAU["lignes_par_arret"].get(a["id"], []))]
 
     lignes_d = {r for a in arrets_dep for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
     lignes_a = {r for a in arrets_arr for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
@@ -2650,7 +2643,8 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
 
     s["guidage_msg"] = None   # propre à CE message
     t = nettoyer_texte(message)
-    if (_est_guidage(message)
+    position_et_question = bool(_RE_POSITION.search(t) and _RE_AIDE.search(t))
+    if (_est_guidage(message) or position_et_question
             or (s.get("guidage_actif") and
                 (_RE_POSITION.search(t) or _RE_SUIVI_EN_COURS.search(t))
                 and not _RE_NOUVEAU.search(t))):
@@ -3221,7 +3215,9 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
 
 _RE_AIDE = re.compile(r"(ne trouve pas|n.?arrive pas|perdu|\bou (est|sont|trouver|se trouve)|c.?est ou|"
                       r"comment (faire|trouver|rejoindre)|je cherche|quel (bus|gbaka)|je prends quoi|"
-                      r"ou (je )?(descends|descendre|monte|monter|prendre))")
+                      r"ou (je )?(descends|descendre|monte|monter|prendre)|"
+                      r"je (?:peux|dois) (?:le )?(?:prendre|monter|descendre)|"
+                      r"je vois (?:le )?(?:bus|gbaka|woro)|est-ce que je peux (?:le )?prendre)")
 _RE_POSITION = re.compile(r"(je suis|je me trouve|me voici|arrive[e]? (a|au|aux)|je viens d.?arriv|devant|pres de|a cote de)")
 _RE_SUIVI_EN_COURS = re.compile(
     r"(ou (est-ce que )?je descends|ou descendre|quel arret|prochain arret|"
@@ -3230,8 +3226,9 @@ _RE_SUIVI_EN_COURS = re.compile(
     r"je ne trouve pas|je trouve pas|je suis perdu|je suis perdue)"
 )
 _RE_NOUVEAU = re.compile(r"(je veux aller|je voudrais aller|pour aller|trajet (pour|de|vers)|itineraire)")
-_RE_LIEU = re.compile(r"(?:suis|trouve|voici|arriv\w*|devant|pr[èe]s d[eu]|c[ôo]t[ée] d[eu])\s+(?:\w+\s+){0,2}?"
-                      r"(?:[àa]|au|aux|devant|vers|chez)\s+(.+?)(?=\s+(?:mais|et|je|j'|comment|o[ùu]|car|donc|pour)\b|[,.;!?]|$)")
+_RE_LIEU = re.compile(r"(?:je suis|je me trouve|me voici|j'arrive|je viens d'arriver|arrive\w*|devant|près de|pres de|à côté de|a cote de)\s+"
+                      r"(?:à|a|au|aux|devant|vers|chez)?\s*(.+?)"
+                      r"(?=\s+(?:mais|et|je|j'|comment|où|ou|car|donc|pour)\b|[,.;!?]|$)", re.I)
 
 
 def _est_guidage(message: str) -> bool:
