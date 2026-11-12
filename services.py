@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 import re
 import threading
@@ -2566,6 +2567,8 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if not session_id:
         return
     s = SESSIONS[session_id]
+    if intention.get("intention") == "TRAJET":      # nouvelle recherche : on repart de zéro côté guidage
+        s["guidage_actif"], s["guidage_contexte"] = False, None
     for cle in ("depart", "destination"):
         if intention.get(cle):
             s[cle] = intention[cle]
@@ -2587,6 +2590,13 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
     attente = bool(s.get("attente_mode"))
     mode_msg = extraire_mode(message, accepter_tous=attente)
     budget_msg = extraire_budget(message)
+
+    s["guidage_msg"] = None   # propre à CE message
+    t = nettoyer_texte(message)
+    if _est_guidage(message) or (s.get("guidage_actif") and _RE_POSITION.search(t) and not _RE_NOUVEAU.search(t)):
+        # « je suis à X, je ne trouve pas Y » : on accompagne, on ne relance pas un trajet
+        s["guidage_msg"], s["guidage_actif"] = {}, True
+        return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
 
     if re.search(r"(comment (tu|vous) (t|vous )?.?appel|qui (es|etes).?(tu|vous)|tu es qui|ton nom|"
                  r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", nettoyer_texte(message)):
@@ -2664,6 +2674,8 @@ Mémoire de la session :
 - Budget connu : {s.get('budget_fcfa') or 'aucun'}
 - Mode connu : {s.get('mode_transport') or 'non précisé'}
 
+Guidage en cours : {'oui, l utilisateur est en déplacement et tu l accompagnes' if s.get('guidage_actif') else 'non'}
+
 RÈGLES DE SUIVI :
 - Le message CHANGE ou RELANCE la recherche (autre mode : "et en gbaka ?", autre départ : "et depuis Yopougon ?",
   autre budget, "je suis pressé, donne-moi un autre trajet", "propose-moi autre chose") -> intention = TRAJET,
@@ -2674,6 +2686,11 @@ RÈGLES DE SUIVI :
   même juste après un trajet) -> intention = CONVERSATION. Dans ce cas on ne renvoie JAMAIS d'itinéraire.
 """
 
+    regle_guidage = """- intention = "GUIDAGE" quand l'utilisateur est déjà en chemin ou sur place et veut être accompagné : il dit où il
+  est ("je suis à Adjamé Liberté", "je suis devant la pharmacie"), ce qu'il voit, qu'il est perdu, qu'il ne trouve pas
+  une gare / un arrêt, qu'il est monté dans le bus ou le gbaka, qu'il est arrivé quelque part, ou demande "et maintenant ?"
+  / "je fais quoi ?" / "où je descends ?" pendant son déplacement. Dans ce cas remplis lieu_actuel (le lieu ou repère
+  où il se trouve, sinon null) et recherche (ce qu'il cherche : "gare gbaka", "arrêt de bus", ... sinon null)."""
     prompt = f"""Tu es un assistant de transport à Abidjan.
 Analyse le message de l'utilisateur et réponds UNIQUEMENT avec un JSON valide.
 
@@ -2685,7 +2702,9 @@ Historique récent :
 
 Réponds exactement avec ce format JSON :
 {{
-  "intention": "TRAJET" ou "SUIVI" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "intention": "TRAJET" ou "SUIVI" ou "GUIDAGE" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "lieu_actuel": "où il se trouve ou null (GUIDAGE seulement)",
+  "recherche": "ce qu'il cherche ou null (GUIDAGE seulement)",
   "depart": "lieu de départ ou null",
   "destination": "lieu d'arrivée ou null",
   "priorite": "duree" ou "prix" ou null,
@@ -2697,6 +2716,7 @@ Règles importantes :
 - intention = "CONVERSATION" pour TOUT ce qui n'est pas une demande de déplacement : salutation,
   remerciement, discussion libre, culture générale, blague, question sur toi, etc.
 - intention = "TRAJET" uniquement si l'utilisateur veut aller quelque part ou relance/modifie la recherche de trajet
+{regle_guidage}
 - N'invente jamais un lieu : mets null si le lieu n'est pas dans le message ou dans la mémoire
 - Ne mets jamais de texte en dehors du JSON
 """
@@ -2715,6 +2735,11 @@ Règles importantes :
         fin = texte.rfind("}") + 1
         if debut >= 0 and fin > debut:
             data = json.loads(texte[debut:fin])
+            if data.get("intention") == "GUIDAGE":
+                vide = _valeur_vide
+                s["guidage_msg"] = {"lieu": None if vide(data.get("lieu_actuel")) else data["lieu_actuel"],
+                                    "recherche": None if vide(data.get("recherche")) else data["recherche"]}
+                s["guidage_actif"], data["intention"] = True, "CONVERSATION"
             return _completer_analyse(data, s, mode_msg, budget_msg)
     except Exception as e:
         log.error("erreur analyse intention : %s", e)
@@ -3114,6 +3139,171 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
     return "\n\n".join(parts)
 
 
+# accompagnement sur place (Google Maps + réseau local)
+
+_RE_AIDE = re.compile(r"(ne trouve pas|n.?arrive pas|perdu|\bou (est|sont|trouver|se trouve)|c.?est ou|"
+                      r"comment (faire|trouver|rejoindre)|je cherche|quel (bus|gbaka)|je prends quoi|"
+                      r"ou (je )?(descends|descendre|monte|monter|prendre))")
+_RE_POSITION = re.compile(r"(je suis|je me trouve|me voici|arrive[e]? (a|au|aux)|je viens d.?arriv|devant|pres de|a cote de)")
+_RE_NOUVEAU = re.compile(r"(je veux aller|je voudrais aller|pour aller|trajet (pour|de|vers)|itineraire)")
+_RE_LIEU = re.compile(r"(?:suis|trouve|voici|arriv\w*|devant|pr[èe]s d[eu]|c[ôo]t[ée] d[eu])\s+(?:\w+\s+){0,2}?"
+                      r"(?:[àa]|au|aux|devant|vers|chez)\s+(.+?)(?=\s+(?:mais|et|je|j'|comment|o[ùu]|car|donc|pour)\b|[,.;!?]|$)")
+
+
+def _est_guidage(message: str) -> bool:
+    t = nettoyer_texte(message)
+    return bool(_RE_AIDE.search(t) and _RE_POSITION.search(t) and not _RE_NOUVEAU.search(t))
+
+
+def _direction(lat1, lon1, lat2, lon2) -> str:
+    ang = (math.degrees(math.atan2(lon2 - lon1, lat2 - lat1)) + 360) % 360
+    return ("au nord", "au nord-est", "à l'est", "au sud-est", "au sud",
+            "au sud-ouest", "à l'ouest", "au nord-ouest")[int((ang + 22.5) // 45) % 8]
+
+
+def _chercher_maps(requete: str, lat: float, lon: float, n: int = 4) -> list:
+    cle = ("maps", requete.lower(), round(lat, 3), round(lon, 3))
+    deja = cache_get(cle)
+    if deja is not None:
+        return deja
+    try:
+        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps", "type": "search", "q": requete,
+                              "ll": f"@{lat},{lon},15z", "hl": "fr", "gl": "ci"}).as_dict()
+    except Exception as e:
+        log.warning("recherche maps echouee : %s", e)
+        return []
+    out = []
+    for r in (res.get("local_results") or []) + ([res["place_results"]] if res.get("place_results") else []):
+        c = r.get("gps_coordinates") or {}
+        if c.get("latitude") is None or c.get("longitude") is None:
+            continue
+        out.append({"nom": r.get("title") or "lieu", "adresse": r.get("address") or "",
+                    "latitude": c["latitude"], "longitude": c["longitude"],
+                    "distance_m": int(distance_m(lat, lon, c["latitude"], c["longitude"])),
+                    "direction": _direction(lat, lon, c["latitude"], c["longitude"])})
+    out = sorted(out, key=lambda x: x["distance_m"])[:n]
+    cache_set(cle, out)
+    return out
+
+
+def _itineraire_marche(lat, lon, tlat, tlon, n: int = 6) -> list:
+    """Indications de marche pas à pas (Google Maps Directions) ; [] si indisponible."""
+    cle = ("marche", round(lat, 4), round(lon, 4), round(tlat, 4), round(tlon, 4))
+    deja = cache_get(cle)
+    if deja:
+        return deja
+    try:
+        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps_directions", "travel_mode": 2,
+                              "start_coords": f"{lat},{lon}", "end_coords": f"{tlat},{tlon}",
+                              "hl": "fr", "gl": "ci"}).as_dict()
+        pas = [d for t in ((res.get("directions") or [{}])[0].get("trips") or []) for d in t.get("details", [])]
+    except Exception as e:
+        log.warning("itineraire marche echoue : %s", e)
+        return []
+    out = [f"{d['title'].strip()} ({d.get('formatted_distance', '')})".replace(" ()", "")
+           for d in pas if d.get("title")][:n]
+    if out:
+        cache_set(cle, out)
+    return out
+
+
+def _situer_sur_trajet(c: dict, lat, lon):
+    """Estime où l'utilisateur en est sur son trajet. Renvoie (texte, prochain_point ou None)."""
+    etapes = c.get("etapes", [])
+    pts = [(-1, etapes[0]["depart"], etapes[0]["depart_pos"])] if etapes and etapes[0].get("depart_pos") else []
+    pts += [(k, e["arrivee"], e["arrivee_pos"]) for k, e in enumerate(etapes) if e.get("arrivee_pos")]
+    if not pts:
+        return "", None
+    k, nom, pos = min(pts, key=lambda x: distance_m(lat, lon, x[2]["latitude"], x[2]["longitude"]))
+    d = distance_m(lat, lon, pos["latitude"], pos["longitude"])
+    suivant = next((e for e in etapes[k + 1:] if e.get("depart_pos")), None) if d <= 150 else etapes[0]
+    if k + 1 >= len(etapes) and d <= 150:
+        return f"Il est arrivé : à {int(d)} m de la destination « {nom} ».", None
+    texte = (f"Estimation : il est à {_dist_txt(d)} de « {nom} ». " if d <= 150 else
+             f"Estimation : il n'est sur aucun point du trajet (le plus proche : « {nom} », à {_dist_txt(d)}). ")
+    if suivant:
+        texte += (f"Prochaine étape : {suivant['mode']} {suivant.get('numero_ligne') or ''} "
+                  f"de « {suivant['depart']} » à « {suivant['arrivee']} ».").replace("  ", " ")
+        return texte, (suivant["depart"], suivant["depart_pos"])
+    return texte, None
+
+
+def _reponse_guidage(message: str, contexte: dict, historique: list, s: dict, memoire_txt: str) -> str:
+    """Accompagnement pas à pas : on localise l'utilisateur (ce qu'il dit, sinon son GPS, sinon sa dernière
+    position), on cherche autour de lui (réseau MobiGo + Google Maps), on le situe sur son trajet et on lui
+    donne les indications de marche vers la prochaine étape."""
+    info = s.get("guidage_msg") or {}
+    m = _RE_LIEU.search(message.lower())
+    lieu = info.get("lieu") or (m.group(1).strip() if m else None)
+    gps = (contexte.get("latitude", contexte.get("lat")), contexte.get("longitude", contexte.get("lon")))
+    ancienne = s.get("position")
+    if lieu:   # un repère (« la pharmacie ») se cherche près de la dernière position connue, un quartier non
+        proche = _chercher_maps(lieu, ancienne["latitude"], ancienne["longitude"], 1) if ancienne else []
+        pos = rechercher_lieu(lieu) if not (proche and proche[0]["distance_m"] < 1500) else None
+        if proche and not pos:
+            pos = {"latitude": proche[0]["latitude"], "longitude": proche[0]["longitude"]}
+        if pos:
+            s["position"] = {"nom": lieu, "latitude": pos["latitude"], "longitude": pos["longitude"]}
+    elif gps[0] is not None and gps[1] is not None:
+        s["position"] = {"nom": "sa position GPS", "latitude": gps[0], "longitude": gps[1]}
+    p = s.get("position")
+    if not p:
+        return ("Dis-moi où tu te trouves (quartier, grand repère) ou partage ta position, "
+                "et je te guide pas à pas 😊")
+    lat, lon = p["latitude"], p["longitude"]
+
+    t = nettoyer_texte(message)
+    modes = [mo for mo, mots in (("GBAKA", ("gbaka", "woro", "gare")), ("BUS", ("bus", "sotra", "arret")),
+                                 ("BATEAU", ("bateau", "lagunaire"))) if any(w in t for w in mots)] or None
+    cherche = info.get("recherche") or (_RE_AIDE.search(t) and (
+        "gare gbaka" if modes and "GBAKA" in modes else
+        "gare lagunaire bateau-bus" if modes and "BATEAU" in modes else "arrêt de bus SOTRA"))
+    faits = [f"Position de l'utilisateur : {p['nom']}."]
+    cible = None
+    if cherche:
+        reseau = arrets_proximite_par_modes(lat, lon, 1500, modes)[:4]
+        if reseau:
+            faits.append("Arrêts du réseau MobiGo proches : " + " ; ".join(
+                f"{a['nom']} ({a['distance_m']} m {_direction(lat, lon, a['latitude'], a['longitude'])})" for a in reseau))
+        lieux = _chercher_maps(f"{cherche} {p['nom'] if lieu else ''}".strip(), lat, lon)
+        if lieux:
+            faits.append("Lieux trouvés sur Google Maps (à vérifier sur place) : " + " ; ".join(
+                f"{x['nom']} ({x['distance_m']} m {x['direction']}{', ' + x['adresse'] if x['adresse'] else ''})"
+                for x in lieux))
+        premier = (lieux or reseau or [None])[0]
+        if premier and premier.get("latitude") is not None:
+            cible = (premier["nom"], {"latitude": premier["latitude"], "longitude": premier["longitude"]})
+        elif premier:
+            cible = (premier["nom"], RESEAU["arrets"].get(premier.get("id"), {}))
+    options = s.get("dernieres_options") or []
+    if options:
+        situation, prochain = _situer_sur_trajet(options[0], lat, lon)
+        faits.append("Trajet de l'utilisateur :\n" + decrire_trajet(options[0]) + ("\n" + situation if situation else ""))
+        cible = cible or prochain
+    if cible and cible[1].get("latitude") is not None and 30 < distance_m(lat, lon, cible[1]["latitude"], cible[1]["longitude"]) < 3000:
+        pas = _itineraire_marche(lat, lon, cible[1]["latitude"], cible[1]["longitude"])
+        if pas:
+            faits.append(f"Marche vers « {cible[0]} » (Google Maps) : " + " > ".join(pas))
+    s["guidage_contexte"] = " | ".join(faits)[:1800]
+
+    if not client:
+        return "\n".join(faits[1:]) or "Je n'ai rien trouvé autour de toi, décris-moi ce que tu vois !"
+    prompt = (f"{message}\n\n[Infos fiables pour t'aider à guider l'utilisateur :\n" + "\n".join(faits) + "]\n"
+              "Tu es son guide sur place. Réponds d'abord à sa question ou à son besoin, puis donne-lui la ou les "
+              "1-2 prochaines actions concrètes (direction, distance, repère à repérer, ligne à prendre, où descendre) "
+              "en utilisant UNIQUEMENT ces infos et ce qu'il t'a dit. Les gares de gbaka sont souvent informelles : "
+              "invite-le à confirmer sur place auprès des apprentis ou chauffeurs. Si une info manque, dis-le et "
+              "demande-lui ce qu'il voit autour de lui (enseigne, grand bâtiment, carrefour). Ne renvoie jamais vers "
+              "Google Maps ou Waze. 5 phrases maximum, puis invite-le à te dire quand il y est pour continuer.")
+    try:
+        r = client.chat.completions.create(model=MODEL, messages=_messages_llm(SYSTEME_AMI + memoire_txt, prompt, historique),
+                                           temperature=0.4, max_tokens=500)
+        return _phrase_complete(r.choices[0].message.content, r.choices[0].finish_reason == "length")
+    except Exception as e:
+        log.error("erreur guidage : %s", e)
+        return "\n".join(faits[1:]) or "Dis-moi ce que tu vois autour de toi et je te guide."
+
+
 #  generer_reponse — naturel, sans répétition 
 def generer_reponse(message: str, contexte: dict, historique: list = None,
                     session_id: str = None) -> str:
@@ -3133,6 +3323,12 @@ def generer_reponse(message: str, contexte: dict, historique: list = None,
                            f"destination={s.get('destination')}, "
                            f"budget={s.get('budget_fcfa') or 'aucun'}, "
                            f"mode={s.get('mode_transport') or 'non précisé'}")
+
+    if s.get("guidage_contexte"):
+        memoire_txt += ("\nL'utilisateur est en train d'être guidé sur place. Dernières infos trouvées pour lui "
+                        f"(continue à le guider avec elles) : {s['guidage_contexte']}")
+    if statut != "TRAJET" and (s.get("guidage_msg") is not None or _est_guidage(message)):
+        return _reponse_guidage(message, contexte, historique, s, memoire_txt)
 
     if statut == "TRAJET":
         return _reponse_trajet(message, contexte, candidats, mode, historique, s,
