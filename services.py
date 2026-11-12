@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 import re
 import threading
@@ -147,6 +148,9 @@ def rechercher_lieu(lieu: Optional[str]):
         f"{lieu_clean} Abidjan",
     ]
 
+    mots_recherche = set(extraire_mots(lieu_clean))
+    meilleur = None
+    meilleur_score = 0.0
     for q in queries:
         try:
             res = serpapi.search({
@@ -174,19 +178,34 @@ def rechercher_lieu(lieu: Optional[str]):
             if lat is None or lon is None:
                 continue
             titre = (r.get("title") or lieu_clean).strip()
-            # on évite les résultats trop vagues ou hors Abidjan si possible
-            adresse = (r.get("address") or "").lower()
-            if "abidjan" not in adresse and "côte d'ivoire" not in adresse and "cote d'ivoire" not in adresse:
-                # on accepte quand même si c'est le premier résultat pertinent
-                pass
+            # Maps peut renvoyer en premier un homonyme hors d'Abidjan. Le nom
+            # du résultat doit correspondre à la demande et les coordonnées
+            # doivent rester dans la zone couverte par le réseau.
+            lat, lon = float(lat), float(lon)
+            if not (5.15 <= lat <= 5.55 and -4.25 <= lon <= -3.75):
+                continue
+            mots_titre = set(extraire_mots(titre))
+            mots_adresse = set(extraire_mots(r.get("address") or ""))
+            if mots_recherche:
+                recouvrement_titre = len(mots_recherche & mots_titre) / len(mots_recherche)
+                recouvrement_adresse = len(mots_recherche & mots_adresse) / len(mots_recherche)
+                score = max(recouvrement_titre, recouvrement_adresse * 0.7)
+                if score < 0.5:
+                    continue
+            else:
+                score = 1.0
             resultat = {
                 "nom": titre,
-                "latitude": float(lat),
-                "longitude": float(lon),
+                "latitude": lat,
+                "longitude": lon,
                 "alternatives": [],
             }
-            cache_set(cle, resultat)
-            return resultat
+            if score > meilleur_score:
+                meilleur, meilleur_score = resultat, score
+
+    if meilleur:
+        cache_set(cle, meilleur)
+        return meilleur
 
     return None
 
@@ -1166,12 +1185,17 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         return c.get("nb_correspondances", 0) + (1 if marche_finale(c) > 500 else 0)
 
     def cle(c):
-        base = c.get("nb_arrets", 0) + (_acces_m(c) + marche_finale(c)) / 200.0
+        # Proposer d'abord les trajets dont les arrêts de montée ET de descente
+        # sont les plus proches des deux points demandés. Les autres critères
+        # départagent ensuite les trajets ayant des marches comparables.
+        marche_totale = _acces_m(c) + marche_finale(c)
+        base = c.get("nb_arrets", 0) + marche_totale / 200.0
         if priorite == "prix":
-            return (eff(c), c.get("cout_partiel_fcfa", 0), base, c.get("duree_minutes", 999))
+            return (_acces_m(c), marche_finale(c), eff(c), c.get("cout_partiel_fcfa", 0), base,
+                    c.get("duree_minutes", 999))
         if priorite == "duree":
-            return (eff(c), c.get("duree_minutes", 999), base)
-        return (eff(c), base, c.get("duree_minutes", 999))
+            return (_acces_m(c), marche_finale(c), eff(c), c.get("duree_minutes", 999), base)
+        return (_acces_m(c), marche_finale(c), eff(c), base, c.get("duree_minutes", 999))
 
     def famille(c):
         return frozenset(e["mode"] for e in _etapes_transport(c))
@@ -1201,7 +1225,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         return fusion
 
     mini = min(eff(c) for c in cands)
-    groupes = grouper([c for c in cands if eff(c) == mini])
+    groupes = grouper(cands)
     choisis = groupes[:maxi]
 
     # ── Diversité : UNIQUEMENT si le mode demandé = TOUS ──
@@ -1315,12 +1339,17 @@ def candidats_multimodaux(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix
 
         out = construire_candidats(dep, dest, mode_filtre, prix_max_ligne)
         purs = [c for c in out if modes_du_trajet(c) <= autorises]
-        if not purs:
-            # aucun trajet 100 % dans ce mode : on cherche des trajets qui le COMBINENT avec un autre
-            mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
-            purs = [c for c in mixtes if modes_du_trajet(c) & autorises and not modes_du_trajet(c) <= autorises]
-            for c in purs:
+        # Garder aussi les trajets mixtes qui incluent le mode demandé. Ils sont
+        # utiles quand ce mode seul laisse une longue marche (ex. bus puis woro-woro).
+        mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
+        deja = {_signature_candidat(c) for c in purs}
+        for c in mixtes:
+            modes_trajet = modes_du_trajet(c)
+            sig = _signature_candidat(c)
+            if modes_trajet & autorises and not modes_trajet <= autorises and sig not in deja:
                 c["combo_mode"] = mode_filtre
+                purs.append(c)
+                deja.add(sig)
         for c in purs:
             _ajouter_textes(c)
         return purs
@@ -1453,6 +1482,9 @@ def _duree_sur_ligne(ids: list) -> int:
 
 ATTENTE_MINUTES = {"BUS": 8, "GBAKA": 3, "WORO_WORO": 3, "BATEAU": 15}
 SEUIL_MARCHE_LONGUE_M = 1000
+# Montée tolérée : pour un mode donné (bus, bateau-bus), on accepte de marcher jusqu'à
+# TOLERANCE_MONTEE_M de plus que jusqu'à l'arrêt le plus proche de ce mode.
+TOLERANCE_MONTEE_M = 500
 
 
 def _ajouter_attente(candidat: dict):
@@ -1533,6 +1565,30 @@ def _variante_woro_si_longue_marche(candidat: dict):
     variante["cout_fcfa"] = variante.get("cout_fcfa", 0) + cout_woro
     variante["marche_m"] = max(0, variante.get("marche_m", 0) - marche_remplacee["distance_m"])
     variante["variante"] = "woro_remplace_marche"
+    return variante
+
+
+def _variante_woro_fin_si_longue_marche(candidat: dict):
+    """Propose un woro-woro pour le dernier tronçon à pied trop long.
+    Le caractère informel du service est signalé dans le texte de l'étape."""
+    etapes = candidat.get("etapes", [])
+    if not etapes or etapes[-1].get("mode") != "MARCHE":
+        return None
+    marche = etapes[-1]
+    if marche.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
+        return None
+    variante = copy.deepcopy(candidat)
+    marche = variante["etapes"].pop()
+    variante["etapes"].append({
+        "mode": "WORO_WORO", "depart": marche["depart"], "arrivee": marche["arrivee"],
+        "depart_pos": marche["depart_pos"], "arrivee_pos": marche["arrivee_pos"],
+        "distance_m": marche["distance_m"], "duree_minutes": max(3, marche["distance_m"] // 400),
+        "cout_fcfa": 0, "attente_minutes": ATTENTE_MINUTES.get("WORO_WORO", 3),
+        "informel_a_confirmer": True,
+    })
+    variante["marche_m"] = max(0, variante.get("marche_m", 0) - marche["distance_m"])
+    variante["duree_minutes"] += max(3, marche["distance_m"] // 400) + ATTENTE_MINUTES.get("WORO_WORO", 3) - marche.get("duree_minutes", 0)
+    variante["variante"] = "woro_remplace_marche_finale"
     return variante
 
 
@@ -1722,13 +1778,22 @@ def _candidats_deux_correspondances(dep, dest, modes, arrets_dep, arrets_arr, pr
                             "etapes": etapes, "arrets_itineraire": [],
                         }
                         cle = (r1, r2, r3)
-                        if cle not in resultats or _score_trajet(cand) < _score_trajet(resultats[cle]):
+                        if cle not in resultats or _priorite_arrets_trajet(cand) < _priorite_arrets_trajet(resultats[cle]):
                             resultats[cle] = cand
     return list(resultats.values())
 
 
 def _score_trajet(c: dict) -> int:
     return c["duree_minutes"] + c.get("marche_m", 0) // 160
+
+
+def _priorite_arrets_trajet(c: dict) -> tuple:
+    """Pour un même ensemble de lignes, préfère d'abord la montée la plus proche,
+    puis la descente la plus proche de la destination."""
+    etapes = c.get("etapes", [])
+    marche_depart = etapes[0].get("distance_m", 0) if etapes and etapes[0].get("mode") == "MARCHE" else 0
+    marche_arrivee = etapes[-1].get("distance_m", 0) if etapes and etapes[-1].get("mode") == "MARCHE" else 0
+    return (marche_depart, marche_arrivee, _score_trajet(c))
 
 
 def construire_candidats(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix_max_ligne=None) -> List[dict]:
@@ -1787,27 +1852,20 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         modes = {"BATEAU"}
 
     arrets_dep_proximite = arrets_proximite(dep["latitude"], dep["longitude"], rayon, True, par_nom=False)
-    arrets_dep = []
-    modes_depart_vus = set()
-    for arret in arrets_dep_proximite:
-        modes_arret = {
-            RESEAU["lignes"].get(rid, {}).get("type")
-            for rid in RESEAU["lignes_par_arret"].get(arret["id"], [])
-        } & modes
-        if not modes_arret - modes_depart_vus:
-            continue
-        arrets_dep.append(arret)
-        modes_depart_vus.update(modes_arret)
-
-    # arrêts « jumeaux » (même nom, <300 m, autre côté de la route) : leurs lignes comptent aussi au départ
-    base = list(arrets_dep)
-    arrets_dep += [b for b in arrets_dep_proximite if b not in base and any(
-        nettoyer_texte(b["nom"]) == nettoyer_texte(a["nom"])
-        and _dist_rapide(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) <= 300 for a in base)]
+    # Garder tous les arrêts valides du rayon, triés par distance. L'ancien
+    # filtre ne gardait que le premier arrêt de chaque mode et pouvait éliminer
+    # la ligne réellement la plus proche de l'utilisateur.
+    arrets_dep = [a for a in arrets_dep_proximite if any(
+        RESEAU["lignes"].get(rid, {}).get("type") in modes
+        for rid in RESEAU["lignes_par_arret"].get(a["id"], []))]
 
     arret_depart_prioritaire = arrets_dep[0] if arrets_dep else None
     arrets_arr_proximite = arrets_proximite(dest["latitude"], dest["longitude"], rayon, True, par_nom=False)
-    arrets_arr = _arrets_utiles(arrets_arr_proximite, modes)
+    # Inclure tous les arrêts valides près de la destination, du plus proche au
+    # plus éloigné, pour que les descentes proches ne soient pas écartées.
+    arrets_arr = [a for a in arrets_arr_proximite if any(
+        RESEAU["lignes"].get(rid, {}).get("type") in modes
+        for rid in RESEAU["lignes_par_arret"].get(a["id"], []))]
 
     lignes_d = {r for a in arrets_dep for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
     lignes_a = {r for a in arrets_arr for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
@@ -1841,6 +1899,21 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         arrets_dep_direct += [a for a in _arrets_utiles(arrets_dep_proximite, modes)
                               if a["id"] not in ids_dep_prioritaires]
         arrets_dep_direct.sort(key=lambda a: a.get("distance_m", 0))
+
+    # Montée tolérée : pour chaque mode (bus, bateau-bus), tous les arrêts situés à moins de
+    # TOLERANCE_MONTEE_M de l'arrêt le plus proche de CE mode. Le classement final
+    # (choisir_propositions) arbitre ensuite entre marche au départ, marche à l'arrivée et nb d'arrêts.
+    ids_montee_toleres = set()
+    for m in modes & {"BUS", "BATEAU"}:
+        cand_m = [a for a in arrets_dep_proximite if m in a.get("types", [])]
+        if cand_m:
+            d0 = cand_m[0]["distance_m"]          # liste déjà triée par distance
+            ids_montee_toleres |= {a["id"] for a in cand_m if a["distance_m"] <= d0 + TOLERANCE_MONTEE_M}
+    deja_ids = {a["id"] for a in arrets_dep_direct}
+    arrets_dep_direct += [a for a in arrets_dep_proximite
+                          if a["id"] in ids_montee_toleres and a["id"] not in deja_ids]
+    arrets_dep_direct.sort(key=lambda a: a.get("distance_m", 0))
+
     sens_deja_pris = set()
     for a_dep in arrets_dep_direct:
         for info in _lignes_passant_par(a_dep["id"], modes):
@@ -1851,7 +1924,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 if cle_sens in sens_deja_pris:
                     continue
                 sens_deja_pris.add(cle_sens)
-            elif a_dep["id"] not in ids_dep_prioritaires:
+            elif a_dep["id"] not in ids_dep_prioritaires and a_dep["id"] not in ids_montee_toleres:
                 continue
             prix = _prix_ligne(ligne)
             if prix_max_ligne and prix > prix_max_ligne:
@@ -1902,7 +1975,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             nouveau = _assembler(etapes, 0)
             nouveau["arrets_itineraire"] = etapes[1]["arrets"]
             ancien = meilleur_direct.get(info["rid"])
-            if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
+            if not ancien or _priorite_arrets_trajet(nouveau) < _priorite_arrets_trajet(ancien):
                 meilleur_direct[info["rid"]] = nouveau
 
     candidats.extend(meilleur_direct.values())
@@ -1942,7 +2015,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 if cle_sens in sens_corr_pris:
                     continue
                 sens_corr_pris.add(cle_sens)
-            elif a_dep["id"] not in ids_dep_prioritaires:
+            elif a_dep["id"] not in ids_dep_prioritaires and a_dep["id"] not in ids_montee_toleres:
                 continue
             prix1 = _prix_ligne(ligne1)
 
@@ -1956,7 +2029,10 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 continue
             idx_montee = seq1.index(montee_sid)
 
-            for a_arr in arrets_arr_corr[:30]:
+            # Ne pas tronquer les arrêts d'arrivée : un arrêt desservi par une ligne
+            # utile peut se trouver au-delà des 30 premiers, même s'il est plus proche
+            # de la destination qu'un terminus retenu par le classement précédent.
+            for a_arr in arrets_arr_corr:
                 for info2 in _lignes_passant_par(a_arr["id"], modes):
                     ligne2 = info2["ligne"]
                     if ligne2["id"] == ligne1["id"]:
@@ -1997,7 +2073,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                     nouveau = _assembler(etapes, 1)
                     paire = (ligne1["id"], ligne2["id"])
                     ancien = meilleur_corr.get(paire)
-                    if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
+                    if not ancien or _priorite_arrets_trajet(nouveau) < _priorite_arrets_trajet(ancien):
                         meilleur_corr[paire] = nouveau
                     nb_corr = len(meilleur_corr)
                     if nb_corr >= 25:
@@ -2085,6 +2161,9 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         v = _variante_woro_si_longue_marche(c)
         if v:
             variantes_woro.append(v)
+        v_fin = _variante_woro_fin_si_longue_marche(c)
+        if v_fin:
+            variantes_woro.append(v_fin)
     candidats.extend(variantes_woro)
 
     par_vehicules = sorted(candidats, key=lambda c: (c["nb_correspondances"], _score_trajet(c), c["cout_fcfa"]))
@@ -2566,6 +2645,8 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if not session_id:
         return
     s = SESSIONS[session_id]
+    if intention.get("intention") == "TRAJET":      # nouvelle recherche : on repart de zéro côté guidage
+        s["guidage_actif"], s["guidage_contexte"] = False, None
     for cle in ("depart", "destination"):
         if intention.get(cle):
             s[cle] = intention[cle]
@@ -2587,6 +2668,17 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
     attente = bool(s.get("attente_mode"))
     mode_msg = extraire_mode(message, accepter_tous=attente)
     budget_msg = extraire_budget(message)
+
+    s["guidage_msg"] = None   # propre à CE message
+    t = nettoyer_texte(message)
+    position_et_question = bool(_RE_POSITION.search(t) and _RE_AIDE.search(t))
+    if (_est_guidage(message) or position_et_question
+            or (s.get("guidage_actif") and
+                (_RE_POSITION.search(t) or _RE_SUIVI_EN_COURS.search(t))
+                and not _RE_NOUVEAU.search(t))):
+        # « je suis à X, je ne trouve pas Y » : on accompagne, on ne relance pas un trajet
+        s["guidage_msg"], s["guidage_actif"] = {}, True
+        return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
 
     if re.search(r"(comment (tu|vous) (t|vous )?.?appel|qui (es|etes).?(tu|vous)|tu es qui|ton nom|"
                  r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", nettoyer_texte(message)):
@@ -2664,6 +2756,8 @@ Mémoire de la session :
 - Budget connu : {s.get('budget_fcfa') or 'aucun'}
 - Mode connu : {s.get('mode_transport') or 'non précisé'}
 
+Guidage en cours : {'oui, l utilisateur est en déplacement et tu l accompagnes' if s.get('guidage_actif') else 'non'}
+
 RÈGLES DE SUIVI :
 - Le message CHANGE ou RELANCE la recherche (autre mode : "et en gbaka ?", autre départ : "et depuis Yopougon ?",
   autre budget, "je suis pressé, donne-moi un autre trajet", "propose-moi autre chose") -> intention = TRAJET,
@@ -2674,6 +2768,11 @@ RÈGLES DE SUIVI :
   même juste après un trajet) -> intention = CONVERSATION. Dans ce cas on ne renvoie JAMAIS d'itinéraire.
 """
 
+    regle_guidage = """- intention = "GUIDAGE" quand l'utilisateur est déjà en chemin ou sur place et veut être accompagné : il dit où il
+  est ("je suis à Adjamé Liberté", "je suis devant la pharmacie"), ce qu'il voit, qu'il est perdu, qu'il ne trouve pas
+  une gare / un arrêt, qu'il est monté dans le bus ou le gbaka, qu'il est arrivé quelque part, ou demande "et maintenant ?"
+  / "je fais quoi ?" / "où je descends ?" pendant son déplacement. Dans ce cas remplis lieu_actuel (le lieu ou repère
+  où il se trouve, sinon null) et recherche (ce qu'il cherche : "gare gbaka", "arrêt de bus", ... sinon null)."""
     prompt = f"""Tu es un assistant de transport à Abidjan.
 Analyse le message de l'utilisateur et réponds UNIQUEMENT avec un JSON valide.
 
@@ -2685,7 +2784,9 @@ Historique récent :
 
 Réponds exactement avec ce format JSON :
 {{
-  "intention": "TRAJET" ou "SUIVI" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "intention": "TRAJET" ou "SUIVI" ou "GUIDAGE" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "lieu_actuel": "où il se trouve ou null (GUIDAGE seulement)",
+  "recherche": "ce qu'il cherche ou null (GUIDAGE seulement)",
   "depart": "lieu de départ ou null",
   "destination": "lieu d'arrivée ou null",
   "priorite": "duree" ou "prix" ou null,
@@ -2697,6 +2798,7 @@ Règles importantes :
 - intention = "CONVERSATION" pour TOUT ce qui n'est pas une demande de déplacement : salutation,
   remerciement, discussion libre, culture générale, blague, question sur toi, etc.
 - intention = "TRAJET" uniquement si l'utilisateur veut aller quelque part ou relance/modifie la recherche de trajet
+{regle_guidage}
 - N'invente jamais un lieu : mets null si le lieu n'est pas dans le message ou dans la mémoire
 - Ne mets jamais de texte en dehors du JSON
 """
@@ -2715,6 +2817,11 @@ Règles importantes :
         fin = texte.rfind("}") + 1
         if debut >= 0 and fin > debut:
             data = json.loads(texte[debut:fin])
+            if data.get("intention") == "GUIDAGE":
+                vide = _valeur_vide
+                s["guidage_msg"] = {"lieu": None if vide(data.get("lieu_actuel")) else data["lieu_actuel"],
+                                    "recherche": None if vide(data.get("recherche")) else data["recherche"]}
+                s["guidage_actif"], data["intention"] = True, "CONVERSATION"
             return _completer_analyse(data, s, mode_msg, budget_msg)
     except Exception as e:
         log.error("erreur analyse intention : %s", e)
@@ -2988,6 +3095,24 @@ def _ordinal(n: int) -> str:
 _NOM_MODE = {"BUS": "le bus", "GBAKA": "le gbaka", "BATEAU": "le bateau-bus"}
 
 
+def _rang_descente(e: dict) -> int:
+    """Rang réel de l'arrêt de descente : on ignore les doublons consécutifs de même nom
+    (arrêts jumeaux) et les points libres « Bord de route » qui ne sont pas de vrais arrêts."""
+    arrets = e.get("arrets") or []
+    if len(arrets) < 2:
+        return e.get("nb_arrets") or 0
+    n, prec = 0, nettoyer_texte(arrets[0].get("nom", ""))
+    for a in arrets[1:]:
+        if str(a.get("id", "")).startswith("g:"):
+            continue
+        nom = nettoyer_texte(a.get("nom", ""))
+        if nom == prec:
+            continue
+        prec = nom
+        n += 1
+    return n or (e.get("nb_arrets") or 0)
+
+
 def decrire_trajet(c: dict) -> str:
     """Raconte le trajet étape par étape : marche jusqu'à l'arrêt, montée, rang de l'arrêt de
     descente (avec son nom), correspondance. Tout vient des données calculées, rien d'inventé."""
@@ -3022,7 +3147,7 @@ def decrire_trajet(c: dict) -> str:
                 lignes.append(f"Rejoins l'arrêt « {e.get('depart')} » (tout près, à pied).")
             ligne = e.get("numero_ligne")
             nom = _NOM_MODE.get(mode, str(mode).lower()) + (f" {ligne}" if ligne else "")
-            n = e.get("nb_arrets") or 0
+            n = _rang_descente(e)
             descente = (f"descends au {_ordinal(n)} arrêt, à « {e.get('arrivee')} »" if n > 0
                         else f"descends à « {e.get('arrivee')} »")
             t = f"Monte dans {nom} à « {e.get('depart')} », puis {descente}"
@@ -3114,6 +3239,287 @@ def _reponse_trajet(message: str, contexte: dict, candidats: list, mode: str, hi
     return "\n\n".join(parts)
 
 
+# accompagnement sur place (Google Maps + réseau local)
+
+_RE_AIDE = re.compile(r"(ne trouve pas|n.?arrive pas|perdu|\bou (est|sont|trouver|se trouve)|c.?est ou|"
+                      r"comment (faire|trouver|rejoindre)|je cherche|quel (bus|gbaka)|je prends quoi|"
+                      r"ou (je )?(descends|descendre|monte|monter|prendre)|"
+                      r"je (?:peux|dois) (?:le )?(?:prendre|monter|descendre)|"
+                      r"je vois (?:le )?(?:bus|gbaka|woro)|est-ce que je peux (?:le )?prendre)")
+_RE_POSITION = re.compile(r"(je suis|je me trouve|me voici|arrive[e]? (a|au|aux)|je viens d.?arriv|devant|pres de|a cote de)")
+_RE_SUIVI_EN_COURS = re.compile(
+    r"(ou (est-ce que )?je descends|ou descendre|quel arret|prochain arret|"
+    r"je suis monte|je suis montee|je suis dans (le|la|un|une)|"
+    r"je viens de descendre|je suis arrive|et maintenant|je fais quoi|"
+    r"je ne trouve pas|je trouve pas|je suis perdu|je suis perdue)"
+)
+_RE_NOUVEAU = re.compile(r"(je veux aller|je voudrais aller|pour aller|trajet (pour|de|vers)|itineraire)")
+_RE_LIEU = re.compile(r"(?:je suis|je me trouve|me voici|j'arrive|je viens d'arriver|arrive\w*|devant|près de|pres de|à côté de|a cote de)\s+"
+                      r"(?:à|a|au|aux|devant|vers|chez)?\s*(.+?)"
+                      r"(?=\s+(?:mais|et|je|j'|comment|où|ou|car|donc|pour)\b|[,.;!?]|$)", re.I)
+
+
+def _est_guidage(message: str) -> bool:
+    t = nettoyer_texte(message)
+    return bool(_RE_AIDE.search(t) and _RE_POSITION.search(t) and not _RE_NOUVEAU.search(t))
+
+
+def _direction(lat1, lon1, lat2, lon2) -> str:
+    ang = (math.degrees(math.atan2(lon2 - lon1, lat2 - lat1)) + 360) % 360
+    return ("au nord", "au nord-est", "à l'est", "au sud-est", "au sud",
+            "au sud-ouest", "à l'ouest", "au nord-ouest")[int((ang + 22.5) // 45) % 8]
+
+
+def _chercher_maps(requete: str, lat: float, lon: float, n: int = 4) -> list:
+    cle = ("maps", requete.lower(), round(lat, 3), round(lon, 3))
+    deja = cache_get(cle)
+    if deja is not None:
+        return deja
+    try:
+        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps", "type": "search", "q": requete,
+                              "ll": f"@{lat},{lon},15z", "hl": "fr", "gl": "ci"}).as_dict()
+    except Exception as e:
+        log.warning("recherche maps echouee : %s", e)
+        return []
+    out = []
+    for r in (res.get("local_results") or []) + ([res["place_results"]] if res.get("place_results") else []):
+        c = r.get("gps_coordinates") or {}
+        if c.get("latitude") is None or c.get("longitude") is None:
+            continue
+        out.append({"nom": r.get("title") or "lieu", "adresse": r.get("address") or "",
+                    "latitude": c["latitude"], "longitude": c["longitude"],
+                    "distance_m": int(distance_m(lat, lon, c["latitude"], c["longitude"])),
+                    "direction": _direction(lat, lon, c["latitude"], c["longitude"])})
+    out = sorted(out, key=lambda x: x["distance_m"])[:n]
+    cache_set(cle, out)
+    return out
+
+
+def _itineraire_marche(lat, lon, tlat, tlon, n: int = 6) -> list:
+    """Indications de marche pas à pas (Google Maps Directions) ; [] si indisponible."""
+    cle = ("marche", round(lat, 4), round(lon, 4), round(tlat, 4), round(tlon, 4))
+    deja = cache_get(cle)
+    if deja:
+        return deja
+    try:
+        res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps_directions", "travel_mode": 2,
+                              "start_coords": f"{lat},{lon}", "end_coords": f"{tlat},{tlon}",
+                              "hl": "fr", "gl": "ci"}).as_dict()
+        pas = [d for t in ((res.get("directions") or [{}])[0].get("trips") or []) for d in t.get("details", [])]
+    except Exception as e:
+        log.warning("itineraire marche echoue : %s", e)
+        return []
+    out = [f"{d['title'].strip()} ({d.get('formatted_distance', '')})".replace(" ()", "")
+           for d in pas if d.get("title")][:n]
+    if out:
+        cache_set(cle, out)
+    return out
+
+
+def _situer_sur_trajet(c: dict, lat, lon):
+    """Estime où l'utilisateur en est sur son trajet. Renvoie (texte, prochain_point ou None)."""
+    etapes = c.get("etapes", [])
+    pts = [(-1, etapes[0]["depart"], etapes[0]["depart_pos"])] if etapes and etapes[0].get("depart_pos") else []
+    pts += [(k, e["arrivee"], e["arrivee_pos"]) for k, e in enumerate(etapes) if e.get("arrivee_pos")]
+    if not pts:
+        return "", None
+    k, nom, pos = min(pts, key=lambda x: distance_m(lat, lon, x[2]["latitude"], x[2]["longitude"]))
+    d = distance_m(lat, lon, pos["latitude"], pos["longitude"])
+    suivant = next((e for e in etapes[k + 1:] if e.get("depart_pos")), None) if d <= 150 else etapes[0]
+    if k + 1 >= len(etapes) and d <= 150:
+        return f"Il est arrivé : à {int(d)} m de la destination « {nom} ».", None
+    texte = (f"Estimation : il est à {_dist_txt(d)} de « {nom} ». " if d <= 150 else
+             f"Estimation : il n'est sur aucun point du trajet (le plus proche : « {nom} », à {_dist_txt(d)}). ")
+    if suivant:
+        texte += (f"Prochaine étape : {suivant['mode']} {suivant.get('numero_ligne') or ''} "
+                  f"de « {suivant['depart']} » à « {suivant['arrivee']} ».").replace("  ", " ")
+        return texte, (suivant["depart"], suivant["depart_pos"])
+    return texte, None
+
+
+def lignes_depuis_position(lat: float, lon: float, dest: dict, rayon_m: int = 500,
+                           deja: Optional[set] = None, maxi: int = 5) -> List[dict]:
+    """Vérifie, à partir des données du réseau (CSV + GTFS) et des coordonnées, quelles lignes
+    l'utilisateur peut réellement prendre DEPUIS sa position pour se rapprocher de sa destination.
+    Pour chaque arrêt à moins de rayon_m : lignes qui y passent -> arrêts SUIVANTS de la séquence
+    (donc dans le bon sens) -> arrêt le plus proche de la destination. On garde la ligne si la
+    descente est assez près (800 m ; 500 m pour gbaka) ET fait gagner au moins 300 m."""
+    if not RESEAU["charge"]:
+        charger_reseau_local()
+    modes = {"BUS", "GBAKA", "BATEAU"}
+    deja = deja or set()
+    d_direct = distance_m(lat, lon, dest["latitude"], dest["longitude"])
+    meilleurs = {}
+    for arret in RESEAU["arrets"].values():
+        if arret["id"] in RESEAU["points_libres"]:
+            continue
+        if _dist_rapide(lat, lon, arret["latitude"], arret["longitude"]) > rayon_m:
+            continue
+        d_mont = distance_m(lat, lon, arret["latitude"], arret["longitude"])
+        if d_mont > rayon_m:
+            continue
+        for info in _lignes_passant_par(arret["id"], modes):
+            seq, ligne, rid = info["sequence"], info["ligne"], info["rid"]
+            if arret["id"] not in seq:
+                continue
+            idx = seq.index(arret["id"])
+            best_sid, best_d = None, float("inf")
+            for sid in seq[idx + 1:]:
+                ar = RESEAU["arrets"].get(sid)
+                if not ar or sid in RESEAU["points_libres"]:
+                    continue
+                d = distance_m(dest["latitude"], dest["longitude"], ar["latitude"], ar["longitude"])
+                if d < best_d:
+                    best_sid, best_d = sid, d
+            if best_sid is None:
+                continue
+            seuil = DESCENTE_MAX_GBAKA_M if ligne["type"] == "GBAKA" else 800
+            if best_d > seuil or best_d > d_direct - 300:
+                continue
+            descente = RESEAU["arrets"][best_sid]
+            noms = [nettoyer_texte(RESEAU["arrets"][s]["nom"]) for s in seq[idx:seq.index(best_sid, idx) + 1]
+                    if s not in RESEAU["points_libres"]]
+            rang = sum(1 for k in range(1, len(noms)) if noms[k] != noms[k - 1])
+            res = {
+                "rid": rid, "mode": ligne["type"], "numero": ligne.get("numero"), "nom": ligne.get("nom"),
+                "montee": arret["nom"], "montee_m": int(d_mont),
+                "direction": _direction(lat, lon, arret["latitude"], arret["longitude"]),
+                "descente": descente["nom"], "descente_a_dest_m": int(best_d), "rang": rang,
+                "propose": (ligne["type"], _norm_num(ligne.get("numero"))) in deja,
+            }
+            ancien = meilleurs.get(rid)
+            # Pour une même ligne, retenir d'abord l'arrêt de montée le plus
+            # proche de la position actuelle. La proximité de la destination
+            # départage les arrêts de montée à distance comparable.
+            if not ancien or (res["montee_m"], res["descente_a_dest_m"], res["rang"]) < \
+                    (ancien["montee_m"], ancien["descente_a_dest_m"], ancien["rang"]):
+                meilleurs[rid] = res
+    # Le guidage donne d'abord l'arrêt de montée le plus proche de l'utilisateur.
+    # À distance comparable, il favorise le trajet déjà proposé, puis la descente
+    # la plus proche de la destination.
+    out = sorted(meilleurs.values(), key=lambda r: (r["montee_m"], not r["propose"],
+                                                      r["descente_a_dest_m"], r["rang"]))
+    return out[:maxi]
+
+
+def _reponse_guidage(message: str, contexte: dict, historique: list, s: dict, memoire_txt: str) -> str:
+    """Accompagnement pas à pas : on localise l'utilisateur (ce qu'il dit, sinon son GPS, sinon sa dernière
+    position), on cherche autour de lui (réseau MobiGo + Google Maps), on le situe sur son trajet et on lui
+    donne les indications de marche vers la prochaine étape."""
+    info = s.get("guidage_msg") or {}
+    m = _RE_LIEU.search(message.lower())
+    lieu = info.get("lieu") or (m.group(1).strip() if m else None)
+    gps = (contexte.get("latitude", contexte.get("lat")), contexte.get("longitude", contexte.get("lon")))
+    ancienne = s.get("position")
+    position_resolue = False
+    if lieu:   # un repère (« la pharmacie ») se cherche près de la dernière position connue, un quartier non
+        proche = _chercher_maps(lieu, ancienne["latitude"], ancienne["longitude"], 1) if ancienne else []
+        pos = rechercher_lieu(lieu) if not (proche and proche[0]["distance_m"] < 1500) else None
+        if proche and not pos:
+            pos = {"nom": proche[0]["nom"], "latitude": proche[0]["latitude"],
+                   "longitude": proche[0]["longitude"]}
+        if pos:
+            s["position"] = {"nom": pos.get("nom") or lieu,
+                              "latitude": pos["latitude"], "longitude": pos["longitude"]}
+            position_resolue = True
+    if not position_resolue and gps[0] is not None and gps[1] is not None:
+        s["position"] = {"nom": "sa position GPS", "latitude": gps[0], "longitude": gps[1]}
+        position_resolue = True
+    if lieu and not position_resolue:
+        s.pop("guidage_contexte", None)
+        return (f"Je n'arrive pas à situer « {lieu} » avec assez de certitude. "
+                "Donne-moi un repère plus précis à proximité ou partage ta position GPS.")
+    p = s.get("position")
+    if not p:
+        return ("Dis-moi où tu te trouves (quartier, grand repère) ou partage ta position, "
+                "et je te guide pas à pas 😊")
+    lat, lon = p["latitude"], p["longitude"]
+
+    t = nettoyer_texte(message)
+    modes = [mo for mo, mots in (("GBAKA", ("gbaka", "woro", "gare")), ("BUS", ("bus", "sotra", "arret")),
+                                 ("BATEAU", ("bateau", "lagunaire"))) if any(w in t for w in mots)] or None
+    cherche = info.get("recherche") or (_RE_AIDE.search(t) and (
+        "gare gbaka" if modes and "GBAKA" in modes else
+        "gare lagunaire bateau-bus" if modes and "BATEAU" in modes else "arrêt de bus SOTRA"))
+    faits = [f"Position de l'utilisateur : {p['nom']}."]
+    cible = None
+    if cherche:
+        reseau = arrets_proximite_par_modes(lat, lon, 1500, modes)[:4]
+        if reseau:
+            faits.append("Arrêts du réseau MobiGo proches : " + " ; ".join(
+                f"{a['nom']} ({a['distance_m']} m {_direction(lat, lon, a['latitude'], a['longitude'])})" for a in reseau))
+        lieux = _chercher_maps(f"{cherche} {p['nom'] if lieu else ''}".strip(), lat, lon)
+        if lieux:
+            faits.append("Lieux trouvés sur Google Maps (à vérifier sur place) : " + " ; ".join(
+                f"{x['nom']} ({x['distance_m']} m {x['direction']}{', ' + x['adresse'] if x['adresse'] else ''})"
+                for x in lieux))
+        premier = (lieux or reseau or [None])[0]
+        if premier and premier.get("latitude") is not None:
+            cible = (premier["nom"], {"latitude": premier["latitude"], "longitude": premier["longitude"]})
+        elif premier:
+            cible = (premier["nom"], RESEAU["arrets"].get(premier.get("id"), {}))
+    options = s.get("dernieres_options") or []
+    if options:
+        situation, prochain = _situer_sur_trajet(options[0], lat, lon)
+        faits.append("Trajet de l'utilisateur :\n" + decrire_trajet(options[0]) + ("\n" + situation if situation else ""))
+        cible = cible or prochain
+
+    # Vérification sur les données : depuis SA position, quelles lignes mènent vers SA destination ?
+    dest = rechercher_lieu(s["destination"]) if s.get("destination") else None
+    if dest:
+        deja = {(e["mode"], _norm_num(e.get("numero_ligne")))
+                for c in options for e in c.get("etapes", [])
+                if e.get("mode") not in ("MARCHE", "WORO_WORO")}
+        possibles = lignes_depuis_position(lat, lon, dest, deja=deja)
+        if possibles:
+            faits.append("Lignes VÉRIFIÉES (données du réseau) prenables depuis sa position et qui le rapprochent "
+                         f"de « {s['destination']} » : " + " ; ".join(
+                f"{_NOM_MODE.get(r['mode'], r['mode'].lower())} {r['numero'] or ''} : monter à « {r['montee']} » "
+                f"({r['montee_m']} m {r['direction']}), descendre à « {r['descente']} » "
+                f"(au {_ordinal(r['rang'])} arrêt, à {r['descente_a_dest_m']} m de la destination)"
+                f"{' [déjà dans le trajet proposé]' if r['propose'] else ''}".replace("  ", " ")
+                for r in possibles))
+            if options and not any(r["propose"] for r in possibles):
+                faits.append("Attention : la ligne du trajet proposé ne passe pas à moins de 500 m de sa position "
+                             "actuelle ; privilégie les lignes vérifiées ci-dessus.")
+        else:
+            faits.append("Aucune ligne de bus, gbaka ou bateau-bus de nos données ne part à moins de 500 m de sa "
+                         "position en direction de sa destination : il doit d'abord rejoindre un arrêt proche "
+                         "(voir ci-dessus) ou prendre un woro-woro / taxi.")
+
+    if cible and cible[1].get("latitude") is not None and 30 < distance_m(lat, lon, cible[1]["latitude"], cible[1]["longitude"]) < 3000:
+        pas = _itineraire_marche(lat, lon, cible[1]["latitude"], cible[1]["longitude"])
+        if pas:
+            faits.append(f"Marche vers « {cible[0]} » (Google Maps) : " + " > ".join(pas))
+    s["guidage_contexte"] = " | ".join(faits)[:1800]
+
+    if not client:
+        return "\n".join(faits[1:]) or "Je n'ai rien trouvé autour de toi, décris-moi ce que tu vois !"
+    prompt = (f"{message}\n\n[Infos fiables pour t'aider à guider l'utilisateur :\n" + "\n".join(faits) + "]\n"
+              "Tu es son guide sur place. Réponds d'abord à sa question ou à son besoin, puis donne-lui la ou les "
+              "1-2 prochaines actions concrètes (direction, distance, repère à repérer, ligne à prendre, où descendre) "
+              "en utilisant UNIQUEMENT ces infos et ce qu'il t'a dit. Les gares de gbaka sont souvent informelles : "
+              "invite-le à confirmer sur place auprès des apprentis ou chauffeurs. Si une info manque, dis-le et "
+              "demande-lui ce qu'il voit autour de lui (enseigne, grand bâtiment, carrefour). Ne renvoie jamais vers "
+              "Google Maps ou Waze. "
+              "Ne cite que les lignes, arrêts, distances et directions explicitement présents dans les lignes "
+              "vérifiées ou le trajet de l'utilisateur. Les lieux trouvés sur Google Maps ne prouvent pas qu'un "
+              "bus ou un gbaka y passe : ne les présente jamais comme arrêts ou gares de transport. "
+              "Si une ligne vérifiée correspond au trajet déjà proposé et reste accessible, continue ce trajet ; "
+              "ne le remplace par une autre ligne vérifiée que si elle améliore réellement l'accès à la destination. "
+              "L'utilisateur peut poser une question sur son trajet ou sur un autre sujet : réponds d'abord à sa "
+              "question avec les faits disponibles, puis reprends le guidage seulement si sa question concerne le déplacement. "
+              "Si aucune ligne n'est vérifiée, dis-le honnêtement au lieu d'inventer. "
+              "5 phrases maximum, puis invite-le à te dire quand il y est pour continuer.")
+    try:
+        r = client.chat.completions.create(model=MODEL, messages=_messages_llm(SYSTEME_AMI + memoire_txt, prompt, historique),
+                                           temperature=0.4, max_tokens=500)
+        return _phrase_complete(r.choices[0].message.content, r.choices[0].finish_reason == "length")
+    except Exception as e:
+        log.error("erreur guidage : %s", e)
+        return "\n".join(faits[1:]) or "Dis-moi ce que tu vois autour de toi et je te guide."
+
+
 #  generer_reponse — naturel, sans répétition 
 def generer_reponse(message: str, contexte: dict, historique: list = None,
                     session_id: str = None) -> str:
@@ -3133,6 +3539,12 @@ def generer_reponse(message: str, contexte: dict, historique: list = None,
                            f"destination={s.get('destination')}, "
                            f"budget={s.get('budget_fcfa') or 'aucun'}, "
                            f"mode={s.get('mode_transport') or 'non précisé'}")
+
+    if s.get("guidage_contexte"):
+        memoire_txt += ("\nL'utilisateur est en train d'être guidé sur place. Dernières infos trouvées pour lui "
+                        f"(continue à le guider avec elles) : {s['guidage_contexte']}")
+    if statut != "TRAJET" and (s.get("guidage_msg") is not None or _est_guidage(message)):
+        return _reponse_guidage(message, contexte, historique, s, memoire_txt)
 
     if statut == "TRAJET":
         return _reponse_trajet(message, contexte, candidats, mode, historique, s,
