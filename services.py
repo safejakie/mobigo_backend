@@ -1167,12 +1167,16 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         return c.get("nb_correspondances", 0) + (1 if marche_finale(c) > 500 else 0)
 
     def cle(c):
-        base = c.get("nb_arrets", 0) + (_acces_m(c) + marche_finale(c)) / 200.0
+        # Proposer d'abord les trajets dont les arrêts de montée ET de descente
+        # sont les plus proches des deux points demandés. Les autres critères
+        # départagent ensuite les trajets ayant des marches comparables.
+        marche_totale = _acces_m(c) + marche_finale(c)
+        base = c.get("nb_arrets", 0) + marche_totale / 200.0
         if priorite == "prix":
-            return (eff(c), c.get("cout_partiel_fcfa", 0), base, c.get("duree_minutes", 999))
+            return (marche_totale, eff(c), c.get("cout_partiel_fcfa", 0), base, c.get("duree_minutes", 999))
         if priorite == "duree":
-            return (eff(c), c.get("duree_minutes", 999), base)
-        return (eff(c), base, c.get("duree_minutes", 999))
+            return (marche_totale, eff(c), c.get("duree_minutes", 999), base)
+        return (marche_totale, eff(c), base, c.get("duree_minutes", 999))
 
     def famille(c):
         return frozenset(e["mode"] for e in _etapes_transport(c))
@@ -1202,7 +1206,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
         return fusion
 
     mini = min(eff(c) for c in cands)
-    groupes = grouper([c for c in cands if eff(c) == mini])
+    groupes = grouper(cands)
     choisis = groupes[:maxi]
 
     # ── Diversité : UNIQUEMENT si le mode demandé = TOUS ──
@@ -1316,12 +1320,17 @@ def candidats_multimodaux(dep: dict, dest: dict, mode_filtre: str = "TOUS", prix
 
         out = construire_candidats(dep, dest, mode_filtre, prix_max_ligne)
         purs = [c for c in out if modes_du_trajet(c) <= autorises]
-        if not purs:
-            # aucun trajet 100 % dans ce mode : on cherche des trajets qui le COMBINENT avec un autre
-            mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
-            purs = [c for c in mixtes if modes_du_trajet(c) & autorises and not modes_du_trajet(c) <= autorises]
-            for c in purs:
+        # Garder aussi les trajets mixtes qui incluent le mode demandé. Ils sont
+        # utiles quand ce mode seul laisse une longue marche (ex. bus puis woro-woro).
+        mixtes = construire_candidats(dep, dest, "TOUS", prix_max_ligne)
+        deja = {_signature_candidat(c) for c in purs}
+        for c in mixtes:
+            modes_trajet = modes_du_trajet(c)
+            sig = _signature_candidat(c)
+            if modes_trajet & autorises and not modes_trajet <= autorises and sig not in deja:
                 c["combo_mode"] = mode_filtre
+                purs.append(c)
+                deja.add(sig)
         for c in purs:
             _ajouter_textes(c)
         return purs
@@ -1537,6 +1546,30 @@ def _variante_woro_si_longue_marche(candidat: dict):
     variante["cout_fcfa"] = variante.get("cout_fcfa", 0) + cout_woro
     variante["marche_m"] = max(0, variante.get("marche_m", 0) - marche_remplacee["distance_m"])
     variante["variante"] = "woro_remplace_marche"
+    return variante
+
+
+def _variante_woro_fin_si_longue_marche(candidat: dict):
+    """Propose un woro-woro pour le dernier tronçon à pied trop long.
+    Le caractère informel du service est signalé dans le texte de l'étape."""
+    etapes = candidat.get("etapes", [])
+    if not etapes or etapes[-1].get("mode") != "MARCHE":
+        return None
+    marche = etapes[-1]
+    if marche.get("distance_m", 0) <= SEUIL_MARCHE_LONGUE_M:
+        return None
+    variante = copy.deepcopy(candidat)
+    marche = variante["etapes"].pop()
+    variante["etapes"].append({
+        "mode": "WORO_WORO", "depart": marche["depart"], "arrivee": marche["arrivee"],
+        "depart_pos": marche["depart_pos"], "arrivee_pos": marche["arrivee_pos"],
+        "distance_m": marche["distance_m"], "duree_minutes": max(3, marche["distance_m"] // 400),
+        "cout_fcfa": 0, "attente_minutes": ATTENTE_MINUTES.get("WORO_WORO", 3),
+        "informel_a_confirmer": True,
+    })
+    variante["marche_m"] = max(0, variante.get("marche_m", 0) - marche["distance_m"])
+    variante["duree_minutes"] += max(3, marche["distance_m"] // 400) + ATTENTE_MINUTES.get("WORO_WORO", 3) - marche.get("duree_minutes", 0)
+    variante["variante"] = "woro_remplace_marche_finale"
     return variante
 
 
@@ -2107,6 +2140,9 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         v = _variante_woro_si_longue_marche(c)
         if v:
             variantes_woro.append(v)
+        v_fin = _variante_woro_fin_si_longue_marche(c)
+        if v_fin:
+            variantes_woro.append(v_fin)
     candidats.extend(variantes_woro)
 
     par_vehicules = sorted(candidats, key=lambda c: (c["nb_correspondances"], _score_trajet(c), c["cout_fcfa"]))
@@ -2614,7 +2650,10 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
 
     s["guidage_msg"] = None   # propre à CE message
     t = nettoyer_texte(message)
-    if _est_guidage(message) or (s.get("guidage_actif") and _RE_POSITION.search(t) and not _RE_NOUVEAU.search(t)):
+    if (_est_guidage(message)
+            or (s.get("guidage_actif") and
+                (_RE_POSITION.search(t) or _RE_SUIVI_EN_COURS.search(t))
+                and not _RE_NOUVEAU.search(t))):
         # « je suis à X, je ne trouve pas Y » : on accompagne, on ne relance pas un trajet
         s["guidage_msg"], s["guidage_actif"] = {}, True
         return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
@@ -3184,6 +3223,12 @@ _RE_AIDE = re.compile(r"(ne trouve pas|n.?arrive pas|perdu|\bou (est|sont|trouve
                       r"comment (faire|trouver|rejoindre)|je cherche|quel (bus|gbaka)|je prends quoi|"
                       r"ou (je )?(descends|descendre|monte|monter|prendre))")
 _RE_POSITION = re.compile(r"(je suis|je me trouve|me voici|arrive[e]? (a|au|aux)|je viens d.?arriv|devant|pres de|a cote de)")
+_RE_SUIVI_EN_COURS = re.compile(
+    r"(ou (est-ce que )?je descends|ou descendre|quel arret|prochain arret|"
+    r"je suis monte|je suis montee|je suis dans (le|la|un|une)|"
+    r"je viens de descendre|je suis arrive|et maintenant|je fais quoi|"
+    r"je ne trouve pas|je trouve pas|je suis perdu|je suis perdue)"
+)
 _RE_NOUVEAU = re.compile(r"(je veux aller|je voudrais aller|pour aller|trajet (pour|de|vers)|itineraire)")
 _RE_LIEU = re.compile(r"(?:suis|trouve|voici|arriv\w*|devant|pr[èe]s d[eu]|c[ôo]t[ée] d[eu])\s+(?:\w+\s+){0,2}?"
                       r"(?:[àa]|au|aux|devant|vers|chez)\s+(.+?)(?=\s+(?:mais|et|je|j'|comment|o[ùu]|car|donc|pour)\b|[,.;!?]|$)")
@@ -3428,6 +3473,8 @@ def _reponse_guidage(message: str, contexte: dict, historique: list, s: dict, me
               "bus ou un gbaka y passe : ne les présente jamais comme arrêts ou gares de transport. "
               "Si une ligne vérifiée correspond au trajet déjà proposé et reste accessible, continue ce trajet ; "
               "ne le remplace par une autre ligne vérifiée que si elle améliore réellement l'accès à la destination. "
+              "L'utilisateur peut poser une question sur son trajet ou sur un autre sujet : réponds d'abord à sa "
+              "question avec les faits disponibles, puis reprends le guidage seulement si sa question concerne le déplacement. "
               "Si aucune ligne n'est vérifiée, dis-le honnêtement au lieu d'inventer. "
               "5 phrases maximum, puis invite-le à te dire quand il y est pour continuer.")
     try:
