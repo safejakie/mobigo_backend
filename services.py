@@ -890,7 +890,9 @@ def charger_reseau_local():
 
 # arrets a proximite 
 
-def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distance: bool = False) -> List[dict]:
+def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distance: bool = False,
+                     par_nom: bool = True) -> List[dict]:
+    """par_nom=False : garde tous les arrêts d'un même nom (un par sens de la route)."""
     if not RESEAU["charge"]:
         charger_reseau_local()
 
@@ -915,8 +917,9 @@ def arrets_proximite(lat: float, lon: float, rayon_m: int = 5000, tri_par_distan
         else:
             type_principal = "BATEAU"
         nom = arret["nom"]
-        if nom not in uniques or d < uniques[nom]["distance_m"]:
-            uniques[nom] = {
+        cle = nom if par_nom else arret["id"]
+        if cle not in uniques or d < uniques[cle]["distance_m"]:
+            uniques[cle] = {
                 "id": arret["id"], "nom": nom,
                 "latitude": arret["latitude"], "longitude": arret["longitude"],
                 "distance_m": int(d), "type": type_principal, "types": list(types),
@@ -1157,14 +1160,18 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
     if courtes:
         cands = courtes
 
+    def eff(c):
+        # être déposé à plus de 500 m de la destination "coûte" comme une correspondance de plus :
+        # un trajet avec 1 correspondance qui dépose à l'arrêt voisin vaut mieux qu'un direct qui dépose loin
+        return c.get("nb_correspondances", 0) + (1 if marche_finale(c) > 500 else 0)
+
     def cle(c):
-        base = c.get("nb_arrets", 0) + _acces_m(c) / 200.0
+        base = c.get("nb_arrets", 0) + (_acces_m(c) + marche_finale(c)) / 200.0
         if priorite == "prix":
-            return (c.get("nb_correspondances", 0), c.get("cout_partiel_fcfa", 0), base,
-                    c.get("duree_minutes", 999))
+            return (eff(c), c.get("cout_partiel_fcfa", 0), base, c.get("duree_minutes", 999))
         if priorite == "duree":
-            return (c.get("nb_correspondances", 0), c.get("duree_minutes", 999), base)
-        return (c.get("nb_correspondances", 0), base, c.get("duree_minutes", 999))
+            return (eff(c), c.get("duree_minutes", 999), base)
+        return (eff(c), base, c.get("duree_minutes", 999))
 
     def famille(c):
         return frozenset(e["mode"] for e in _etapes_transport(c))
@@ -1193,15 +1200,15 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
                 fusion.append(g)
         return fusion
 
-    mini = min(c.get("nb_correspondances", 0) for c in cands)
-    groupes = grouper([c for c in cands if c.get("nb_correspondances", 0) == mini])
+    mini = min(eff(c) for c in cands)
+    groupes = grouper([c for c in cands if eff(c) == mini])
     choisis = groupes[:maxi]
 
     # ── Diversité : UNIQUEMENT si le mode demandé = TOUS ──
     if mode_filtre == "TOUS" and choisis:
         deja = {m for g in choisis for m in famille(g[0])}
         dur_ref = choisis[0][0].get("duree_minutes", 999) or 999
-        autres = grouper([c for c in cands if c.get("nb_correspondances", 0) <= mini + 1])
+        autres = grouper([c for c in cands if eff(c) <= mini + 1])
         for g in autres:
             if len(choisis) >= maxi:
                 break
@@ -1592,7 +1599,27 @@ def _etape_ligne(ligne, rid, ids):
         "distance_m": distance_m(m["latitude"], m["longitude"], d["latitude"], d["longitude"]),
         "duree_minutes": _duree_sur_ligne(ids), "cout_fcfa": _prix_ligne(ligne),
         "nb_arrets": len(ids) - 1,
+        "arrets": [{"id": a["id"], "nom": a["nom"], "latitude": a["latitude"], "longitude": a["longitude"]}
+                   for a in (RESEAU["arrets"].get(s) for s in ids) if a],
     }
+
+
+def _assembler(etapes: list, nb_correspondances: int) -> dict:
+    return {
+        "duree_minutes": sum(e["duree_minutes"] for e in etapes),
+        "cout_fcfa": sum(e["cout_fcfa"] for e in etapes),
+        "marche_m": sum(e["distance_m"] for e in etapes if e["mode"] == "MARCHE"),
+        "nb_correspondances": nb_correspondances,
+        "etapes": etapes, "arrets_itineraire": [],
+    }
+
+
+def _arret_nomme(arrets: list, cible: str):
+    for a in arrets:
+        nom = nettoyer_texte(a["nom"])
+        if any(m in nom for m in cible.split() if len(m) > 3) or any(m in cible for m in nom.split() if len(m) > 3):
+            return a
+    return None
 
 
 def _meilleur_transfert(seq_a, apres_a, seq_b, avant_b, rayon=300, ligne_b_bus=False):
@@ -1759,9 +1786,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
     elif mode_filtre == "BATEAU":
         modes = {"BATEAU"}
 
-    arrets_dep_proximite = arrets_proximite(
-        dep["latitude"], dep["longitude"], rayon, tri_par_distance=True
-    )
+    arrets_dep_proximite = arrets_proximite(dep["latitude"], dep["longitude"], rayon, True, par_nom=False)
     arrets_dep = []
     modes_depart_vus = set()
     for arret in arrets_dep_proximite:
@@ -1774,10 +1799,14 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
         arrets_dep.append(arret)
         modes_depart_vus.update(modes_arret)
 
+    # arrêts « jumeaux » (même nom, <300 m, autre côté de la route) : leurs lignes comptent aussi au départ
+    base = list(arrets_dep)
+    arrets_dep += [b for b in arrets_dep_proximite if b not in base and any(
+        nettoyer_texte(b["nom"]) == nettoyer_texte(a["nom"])
+        and _dist_rapide(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) <= 300 for a in base)]
+
     arret_depart_prioritaire = arrets_dep[0] if arrets_dep else None
-    arrets_arr_proximite = arrets_proximite(
-        dest["latitude"], dest["longitude"], rayon, tri_par_distance=True
-    )
+    arrets_arr_proximite = arrets_proximite(dest["latitude"], dest["longitude"], rayon, True, par_nom=False)
     arrets_arr = _arrets_utiles(arrets_arr_proximite, modes)
 
     lignes_d = {r for a in arrets_dep for r in RESEAU["lignes_par_arret"].get(a["id"], [])}
@@ -1866,54 +1895,12 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 continue
             vus.add(cle)
 
-            segment = seq[idx_montee:seq.index(meilleur_sid) + 1]
-            sequence_arrets = []
-            for sid in segment:
-                ar = RESEAU["arrets"].get(sid)
-                if ar:
-                    sequence_arrets.append({"id": ar["id"], "nom": ar["nom"],
-                                            "latitude": ar["latitude"], "longitude": ar["longitude"]})
-
             descente = RESEAU["arrets"][meilleur_sid]
-            duree_transport = _duree_sur_ligne(segment)
-
-            marche_debut = {
-                "mode": "MARCHE", "depart": dep.get("nom", "depart"), "arrivee": montee["nom"],
-                "distance_m": int(montee_d),
-                "duree_minutes": max(1, int(montee_d) // 80),
-                "cout_fcfa": 0,
-                "depart_pos": {"latitude": dep["latitude"], "longitude": dep["longitude"]},
-                "arrivee_pos": {"latitude": montee["latitude"], "longitude": montee["longitude"]},
-            }
-            etape = {
-                "mode": ligne["type"], "numero_ligne": ligne.get("numero"),
-                "nom_ligne": ligne.get("nom"),
-                "depart": montee["nom"], "arrivee": descente["nom"],
-                "depart_pos": {"latitude": montee["latitude"], "longitude": montee["longitude"]},
-                "arrivee_pos": {"latitude": descente["latitude"], "longitude": descente["longitude"]},
-                "distance_m": distance_m(montee["latitude"], montee["longitude"],
-                                          descente["latitude"], descente["longitude"]),
-                "duree_minutes": duree_transport,
-                "cout_fcfa": prix, "arrets": sequence_arrets,
-            }
-            marche_fin = {
-                "mode": "MARCHE", "depart": descente["nom"],
-                "arrivee": dest.get("nom", "destination"),
-                "distance_m": int(meilleure_d),
-                "duree_minutes": max(1, int(meilleure_d) // 80),
-                "cout_fcfa": 0,
-                "depart_pos": {"latitude": descente["latitude"], "longitude": descente["longitude"]},
-                "arrivee_pos": {"latitude": dest["latitude"], "longitude": dest["longitude"]},
-            }
-
-            nouveau = {
-                "duree_minutes": marche_debut["duree_minutes"] + duree_transport + marche_fin["duree_minutes"],
-                "cout_fcfa": prix,
-                "marche_m": int(montee_d) + int(meilleure_d),
-                "nb_correspondances": 0,
-                "etapes": [marche_debut, etape, marche_fin],
-                "arrets_itineraire": sequence_arrets,
-            }
+            etapes = [_etape_marche(dep.get("nom", "depart"), montee["nom"], dep, montee, montee_d),
+                      _etape_ligne(ligne, info["rid"], seq[idx_montee:seq.index(meilleur_sid) + 1]),
+                      _etape_marche(descente["nom"], dest.get("nom", "destination"), descente, dest, meilleure_d)]
+            nouveau = _assembler(etapes, 0)
+            nouveau["arrets_itineraire"] = etapes[1]["arrets"]
             ancien = meilleur_direct.get(info["rid"])
             if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
                 meilleur_direct[info["rid"]] = nouveau
@@ -1969,7 +1956,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 continue
             idx_montee = seq1.index(montee_sid)
 
-            for a_arr in arrets_arr_corr[:20]:
+            for a_arr in arrets_arr_corr[:30]:
                 for info2 in _lignes_passant_par(a_arr["id"], modes):
                     ligne2 = info2["ligne"]
                     if ligne2["id"] == ligne1["id"]:
@@ -1992,70 +1979,22 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                     nb2 = idx_arr - seq2.index(sid_m2)
                     if nb1 < 1 or nb2 < 1:
                         continue
-                    prix2 = _prix_ligne(ligne2)
-                    duree1 = _duree_sur_ligne(seq1[idx_montee:idx_montee + nb1 + 1])
-                    duree2 = _duree_sur_ligne(seq2[idx_arr - nb2:idx_arr + 1])
-                    duree_corres = max(2, int(dist_corres) // 80)
+                    ids1 = seq1[idx_montee:idx_montee + nb1 + 1]
+                    ids2 = seq2[idx_arr - nb2:idx_arr + 1]
 
                     cle = ("C", ligne1["id"], ligne2["id"], montee_sid, sid_d1, sid_m2, a_arr["id"])
                     if cle in vus:
                         continue
                     vus.add(cle)
 
-                    marche_debut = {
-                        "mode": "MARCHE", "depart": dep.get("nom", "depart"),
-                        "arrivee": montee1["nom"],
-                        "distance_m": int(montee_d),
-                        "duree_minutes": max(1, int(montee_d) // 80),
-                        "cout_fcfa": 0,
-                        "depart_pos": {"latitude": dep["latitude"], "longitude": dep["longitude"]},
-                        "arrivee_pos": {"latitude": montee1["latitude"], "longitude": montee1["longitude"]},
-                    }
-                    etape1 = {
-                        "mode": ligne1["type"], "numero_ligne": ligne1.get("numero"),
-                        "nom_ligne": ligne1.get("nom"),
-                        "depart": montee1["nom"], "arrivee": ar_d1["nom"],
-                        "depart_pos": {"latitude": montee1["latitude"], "longitude": montee1["longitude"]},
-                        "arrivee_pos": {"latitude": ar_d1["latitude"], "longitude": ar_d1["longitude"]},
-                        "distance_m": distance_m(montee1["latitude"], montee1["longitude"],
-                                                  ar_d1["latitude"], ar_d1["longitude"]),
-                        "duree_minutes": duree1, "cout_fcfa": prix1, "nb_arrets": nb1,
-                    }
-                    marche_corres = {
-                        "mode": "MARCHE", "depart": ar_d1["nom"], "arrivee": ar_m2["nom"],
-                        "distance_m": int(dist_corres), "duree_minutes": duree_corres,
-                        "cout_fcfa": 0,
-                        "depart_pos": {"latitude": ar_d1["latitude"], "longitude": ar_d1["longitude"]},
-                        "arrivee_pos": {"latitude": ar_m2["latitude"], "longitude": ar_m2["longitude"]},
-                    }
-                    etape2 = {
-                        "mode": ligne2["type"], "numero_ligne": ligne2.get("numero"),
-                        "nom_ligne": ligne2.get("nom"),
-                        "depart": ar_m2["nom"], "arrivee": descente2["nom"],
-                        "depart_pos": {"latitude": ar_m2["latitude"], "longitude": ar_m2["longitude"]},
-                        "arrivee_pos": {"latitude": descente2["latitude"], "longitude": descente2["longitude"]},
-                        "distance_m": distance_m(ar_m2["latitude"], ar_m2["longitude"],
-                                                  descente2["latitude"], descente2["longitude"]),
-                        "duree_minutes": duree2, "cout_fcfa": prix2, "nb_arrets": nb2,
-                    }
-                    marche_fin = {
-                        "mode": "MARCHE", "depart": descente2["nom"],
-                        "arrivee": dest.get("nom", "destination"),
-                        "distance_m": a_arr["distance_m"],
-                        "duree_minutes": max(1, a_arr["distance_m"] // 80),
-                        "cout_fcfa": 0,
-                        "depart_pos": {"latitude": descente2["latitude"], "longitude": descente2["longitude"]},
-                        "arrivee_pos": {"latitude": dest["latitude"], "longitude": dest["longitude"]},
-                    }
-                    nouveau = {
-                        "duree_minutes": (marche_debut["duree_minutes"] + duree1
-                                          + duree_corres + duree2 + marche_fin["duree_minutes"]),
-                        "cout_fcfa": prix1 + prix2,
-                        "marche_m": int(montee_d) + int(dist_corres) + a_arr["distance_m"],
-                        "nb_correspondances": 1,
-                        "etapes": [marche_debut, etape1, marche_corres, etape2, marche_fin],
-                        "arrets_itineraire": [],
-                    }
+                    etapes = [_etape_marche(dep.get("nom", "depart"), montee1["nom"], dep, montee1, montee_d),
+                              _etape_ligne(ligne1, info1["rid"], ids1),
+                              _etape_marche(ar_d1["nom"], ar_m2["nom"], ar_d1, ar_m2, dist_corres),
+                              _etape_ligne(ligne2, info2["rid"], ids2),
+                              _etape_marche(descente2["nom"], dest.get("nom", "destination"),
+                                            descente2, dest, a_arr["distance_m"])]
+                    etapes[2]["duree_minutes"] = max(2, etapes[2]["duree_minutes"])
+                    nouveau = _assembler(etapes, 1)
                     paire = (ligne1["id"], ligne2["id"])
                     ancien = meilleur_corr.get(paire)
                     if not ancien or _score_trajet(nouveau) < _score_trajet(ancien):
@@ -2077,40 +2016,11 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             des = nettoyer_texte(c.get("destination") or "")
             if not ori or not des:
                 continue
-            match_dep = False
-            montee = None
-            for a in arrets_dep:
-                nom = nettoyer_texte(a["nom"])
-                if any(m in nom for m in ori.split() if len(m) > 3) or \
-                   any(m in ori for m in nom.split() if len(m) > 3):
-                    match_dep = True
-                    montee = a
-                    break
-            match_arr = False
-            descente = None
-            for a in arrets_arr:
-                nom = nettoyer_texte(a["nom"])
-                if any(m in nom for m in des.split() if len(m) > 3) or \
-                   any(m in des for m in nom.split() if len(m) > 3):
-                    match_arr = True
-                    descente = a
-                    break
-            if not (match_dep and match_arr):
-                for a in arrets_dep:
-                    nom = nettoyer_texte(a["nom"])
-                    if any(m in nom for m in des.split() if len(m) > 3) or \
-                       any(m in des for m in nom.split() if len(m) > 3):
-                        match_dep = True
-                        montee = a
-                        break
-                for a in arrets_arr:
-                    nom = nettoyer_texte(a["nom"])
-                    if any(m in nom for m in ori.split() if len(m) > 3) or \
-                       any(m in ori for m in nom.split() if len(m) > 3):
-                        match_arr = True
-                        descente = a
-                        break
-            if not (match_dep and match_arr and montee and descente):
+            montee, descente = _arret_nomme(arrets_dep, ori), _arret_nomme(arrets_arr, des)
+            if not (montee and descente):
+                montee = _arret_nomme(arrets_dep, des) or montee
+                descente = _arret_nomme(arrets_arr, ori) or descente
+            if not (montee and descente):
                 continue
             trace = c.get("trace") or []
             bbox = c.get("bbox")
@@ -2121,15 +2031,6 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
             if not _point_proche_du_trace(descente["latitude"], descente["longitude"], trace, bbox):
                 continue
             prix = c.get("prix_fcfa") or _prix_ligne({"numero": c.get("numero"), "type": c["type"]})
-            duree = 40
-            marche_debut = {
-                "mode": "MARCHE", "depart": dep.get("nom", "depart"), "arrivee": montee["nom"],
-                "distance_m": montee["distance_m"],
-                "duree_minutes": max(1, montee["distance_m"] // 80),
-                "cout_fcfa": 0,
-                "depart_pos": {"latitude": dep["latitude"], "longitude": dep["longitude"]},
-                "arrivee_pos": {"latitude": montee["latitude"], "longitude": montee["longitude"]},
-            }
             etape = {
                 "mode": c["type"], "numero_ligne": c.get("numero"),
                 "nom_ligne": f"{c['origine']} ↔ {c['destination']}",
@@ -2138,25 +2039,13 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 "arrivee_pos": {"latitude": descente["latitude"], "longitude": descente["longitude"]},
                 "distance_m": distance_m(montee["latitude"], montee["longitude"],
                                           descente["latitude"], descente["longitude"]),
-                "duree_minutes": duree, "cout_fcfa": prix,
+                "duree_minutes": 40, "cout_fcfa": prix,
             }
-            marche_fin = {
-                "mode": "MARCHE", "depart": descente["nom"],
-                "arrivee": dest.get("nom", "destination"),
-                "distance_m": descente["distance_m"],
-                "duree_minutes": max(1, descente["distance_m"] // 80),
-                "cout_fcfa": 0,
-                "depart_pos": {"latitude": descente["latitude"], "longitude": descente["longitude"]},
-                "arrivee_pos": {"latitude": dest["latitude"], "longitude": dest["longitude"]},
-            }
-            candidats.append({
-                "duree_minutes": marche_debut["duree_minutes"] + duree + marche_fin["duree_minutes"],
-                "cout_fcfa": prix,
-                "marche_m": montee["distance_m"] + descente["distance_m"],
-                "nb_correspondances": 0,
-                "etapes": [marche_debut, etape, marche_fin],
-                "arrets_itineraire": [],
-            })
+            candidats.append(_assembler([
+                _etape_marche(dep.get("nom", "depart"), montee["nom"], dep, montee, montee["distance_m"]),
+                etape,
+                _etape_marche(descente["nom"], dest.get("nom", "destination"), descente, dest,
+                              descente["distance_m"])], 0))
             if len(candidats) >= 5:
                 break
 
