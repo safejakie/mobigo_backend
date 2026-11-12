@@ -31,6 +31,7 @@ from services import (
     trajets_par_mode,
     arrets_proximite_par_modes,
     maj_session,
+    message_aucun_trajet,
     SESSIONS,
     RESEAU,
 )
@@ -470,24 +471,12 @@ def assistant_chat(demande: Demande):
         candidats = trajets_pour_demande(candidats, analyse.get("priorite"), prix_max, budget)
 
         if not tous:
-            p_dep = proches["depart"][0] if proches["depart"] else None
-            p_arr = proches["arrivee"][0] if proches["arrivee"] else None
-            infos = []
-            if p_dep:
-                infos.append(f"l'arrêt le plus proche de ton départ est {p_dep['nom']} "
-                             f"(~{p_dep['distance_m']} m)")
-            if p_arr:
-                infos.append(f"celui de ta destination est {p_arr['nom']} "
-                             f"(~{p_arr['distance_m']} m)")
-            detail = (" Pour info, " + " et ".join(infos) + ".") if infos else ""
-            message_aucun = (
-                "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet."
-                if signatures_exclues else
-                "Oups 😅 je ne trouve pas de trajet direct dans ce mode entre ces deux lieux."
-            )
+            if signatures_exclues:
+                texte = "Je n'ai pas trouvé d'autre combinaison pertinente pour ce trajet. Tu veux essayer un autre mode ?"
+            else:
+                texte = message_aucun_trajet(mode_transport, dep, dest)   # clair, sans reproposer le même mode
             return repondre(
-                message_aucun + detail +
-                " Tu veux que j'essaie avec un autre mode (gbaka, bus, bateau-bus) ?",
+                texte,
                 depart=Lieu(**dep), destination=Lieu(**dest),
                 arrets_depart=proches["depart"],
                 arrets_destination=proches["arrivee"],
@@ -507,6 +496,7 @@ def assistant_chat(demande: Demande):
                                         analyse.get("priorite"), budget, maxi=4)
         principal = options[0] if options else None
         maj_session(session_id, analyse, trajet=principal, attente_mode=False)
+        trajet_precedent = SESSIONS[session_id].get("dernieres_options")   # trajet proposé AVANT celui-ci
         SESSIONS[session_id]["dernieres_options"] = options
 
         contexte_llm = {
@@ -517,6 +507,7 @@ def assistant_chat(demande: Demande):
             "prix_max_ligne": prix_max,
             "budget_fcfa": budget,
             "conseil_marche": conseil_marche_chat(options),
+            "trajet_precedent": trajet_precedent,
             "arrets_proches": {k: [{"nom": a["nom"], "distance_m": a["distance_m"]}
                                     for a in v[:3]]
                                 for k, v in proches.items()},

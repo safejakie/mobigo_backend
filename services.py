@@ -20,7 +20,7 @@ from config import (
     cache_get, cache_set, distance_m, log,
 )
 
-# ── RÉGLAGES (on les change ici, à un seul endroit) ──────────────────────────
+# RÉGLAGES (on les change ici, à un seul endroit)
 DESCENTE_MAX_M = 1000          # on descend à 1000 m maximum de la destination
 DESCENTE_MAX_GBAKA_M = 500     # un gbaka dépose plus près (500 m)
 RAYON_DEPART_M = 1500          # on cherche les arrêts de départ dans ce rayon
@@ -200,7 +200,7 @@ def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon
             return lieu
     return ma_position if a_gps else None
 
-# ── 3. DONNÉES : chargement des fichiers CSV ──
+#  3. DONNÉES : chargement des fichiers CSV 
 CATALOGUE = []                 # une entrée par ligne (bus, bateau, gbaka/woro)
 RESEAU = {
     "arrets": {},              # id -> {id, nom, latitude, longitude}
@@ -285,7 +285,7 @@ def charger_catalogue():
         CATALOGUE.append(e)
     log.info("catalogue charge : %d lignes", len(CATALOGUE))
 
-# ── Petits calculs sur la carte ──────────────────────────────────────────────
+#  4. PETITS CALCULS SUR LA CARTE 
 def _dist_rapide(lat1, lon1, lat2, lon2) -> float:
     """Distance approximative en mètres (rapide, assez juste à Abidjan)."""
     dy = (lat1 - lat2) * 111320.0
@@ -319,7 +319,7 @@ def _point_proche_du_trace(lat, lon, trace, bbox, seuil_m=300) -> bool:
         return False
     return any(distance_m(lat, lon, tl, tn) <= seuil_m for tl, tn in trace)
 
-# ── Séquences d'arrêts : dans quel ordre une ligne passe par ses arrêts ─────
+#  5. SÉQUENCES D'ARRÊTS : DANS QUEL ORDRE UNE LIGNE PASSE PAR SES ARRÊTS 
 def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
     """Liste ordonnée des arrêts situés à moins de seuil_m du tracé (sans doublons proches)."""
     passages = defaultdict(list)                       # arrêt -> [(position sur le tracé, distance)]
@@ -340,7 +340,7 @@ def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
             groupe = [h] if h else []
     evenements.sort()
     gardes = []
-    for _, sid in evenements:                          # on enlève les arrêts de même nom très proches
+    for _, sid in evenements:                          
         a = RESEAU["arrets"][sid]
         nom = nettoyer_texte(a["nom"])
         if not any(nettoyer_texte(RESEAU["arrets"][b]["nom"]) == nom and _dist_rapide(
@@ -593,7 +593,7 @@ def charger_reseau_local():
         log.info("reseau pret : %d arrets, %d lignes, %d sequences, %d gares", len(RESEAU["arrets"]),
                  len(RESEAU["lignes"]), len(RESEAU["sequences"]), len(RESEAU["gares"]))
 
-# ── 4. ARRÊTS À PROXIMITÉ ──
+# 4. ARRÊTS À PROXIMITÉ
 def _types_de_l_arret(sid: str) -> set:
     """Les modes (BUS, GBAKA, BATEAU...) des lignes qui passent à cet arrêt."""
     return {RESEAU["lignes"][r]["type"] for r in RESEAU["lignes_par_arret"].get(sid, [])
@@ -646,7 +646,7 @@ def lignes_par_arret(stop_id: str) -> Optional[dict]:
     lignes.sort(key=lambda l: (0 if l["type"] == "BUS" else 1, l["numero"] or "zzz"))
     return {"arret": arret, "lignes": lignes}
 
-# ── 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS ──
+# 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS
 PRIX_CATALOGUE = {}            # (mode, numéro de ligne) -> prix lu dans le CSV
 
 def _norm_num(n) -> str:
@@ -1303,7 +1303,7 @@ def arrets_proches_trajet(dep: dict, dest: dict, mode_filtre: str = "TOUS", rayo
             "arrivee": arrets_proximite_par_modes(dest["latitude"], dest["longitude"], rayon_m, modes)[:5]}
 
 
-# ── 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche) ──
+# 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche)
 def prix_connu(mode, nom_ligne, montee, descente, numero):
     if numero and str(numero) in PRIX_LIGNES:
         return PRIX_LIGNES[str(numero)]
@@ -1432,7 +1432,7 @@ def _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero) -> lis
     if not cands:
         return []
 
-    def repere(nom):                                   # l'arrêt qui porte le nom de l'origine / destination
+    def repere(nom):                                 
         meilleur, sc = None, 0.5
         for sq in cands:
             for sid in sq:
@@ -1534,7 +1534,7 @@ def instructions_trajet(candidat: dict) -> list:
             f"de {e['depart']} a {e['arrivee']}" for e in candidat["etapes"]]
 
 
-# ── 8. ASSISTANT MOBIGUIDE (comprendre le message + répondre avec le LLM Groq) ──
+# 8. ASSISTANT MOBIGUIDE (comprendre le message + répondre avec le LLM Groq)
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # Mémoire de conversation : une case par session_id (départ, destination, budget, mode...)
 SESSIONS = defaultdict(lambda: {"depart": None, "destination": None, "dernier_trajet": None,
@@ -1557,7 +1557,7 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if attente_mode is not None:
         s["attente_mode"] = attente_mode
         if attente_mode:
-            s["mode_demande"] = True                   # la question « quel mode ? » n'est posée qu'une fois
+            s["mode_demande"] = True                  
 
 def extraire_budget(texte: str) -> Optional[int]:
     """Comprend « j'ai 400 », « 400 balles », « moins de 300 », « 2 mille », « 1 500 francs »..."""
@@ -1726,7 +1726,7 @@ Règles :
         log.error("erreur analyse intention : %s", e)
     return _completer_analyse({"intention": "INCONNUE"}, s, mode_msg, budget_msg)
 
-# ── Textes de réponse ────────────────────────────────────────────────────────
+# Textes de réponse
 SYSTEME_AMI = (
     "Tu es MobiGuide, un assistant sympa basé à Abidjan. Tu discutes naturellement, comme un ami : "
     "tu réponds à toutes les questions (pas seulement les transports), en français, de façon courte "
@@ -1838,20 +1838,25 @@ def decrire_trajet(c: dict) -> str:
     return "\n".join(f"{k}. {t}" for k, t in enumerate(lignes, 1))
 
 def message_aucun_trajet(mode: str, dep: dict = None, dest: dict = None) -> str:
-    """Message CLAIR quand aucun trajet n'existe dans le mode demandé (ex : bateau-bus).
-    On dit non, on cite les arrêts les plus proches de ce mode, et on propose UNIQUEMENT les AUTRES modes."""
-    lib = NOM_MODE.get(mode, (mode or "").lower())
-    texte = f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux."
-    if dep and dest and mode in ("BUS", "GBAKA", "BATEAU"):
+    """Message CLAIR quand aucun trajet n'existe. Dans un mode précis (ex : bateau-bus) : on dit non, on cite
+    l'arrêt de ce mode le plus proche et on propose UNIQUEMENT les AUTRES modes (pas de boucle)."""
+    precis = mode in ("BUS", "GBAKA", "BATEAU")
+    lib = NOM_MODE[mode] if precis else "transport"
+    texte = (f"Je n'ai trouvé aucun trajet en {lib} entre ces deux lieux." if precis else
+             "Je n'ai trouvé aucun trajet entre ces deux lieux.")
+    if dep and dest:
         proches = []
         for qui, lieu in (("ton départ", dep), ("ta destination", dest)):
-            a = arrets_proximite_par_modes(lieu["latitude"], lieu["longitude"], 5000, [mode])[:1]
+            a = arrets_proximite_par_modes(lieu["latitude"], lieu["longitude"], 5000, [mode] if precis else None)[:1]
             if a:
                 proches.append(f"{qui} : « {a[0]['nom']} » à {_dist_txt(a[0]['distance_m'])}")
         texte += (f" L'arrêt de {lib} le plus proche de " + " et de ".join(proches) + ".") if proches else \
             f" Il n'y a pas d'arrêt de {lib} près de ces lieux."
+    if not precis:
+        return texte + " Vérifie ton départ et ta destination, ou précise un quartier."
     autres = [NOM_MODE[m] for m in ("BUS", "GBAKA", "BATEAU") if m != mode]
     return texte + f" Je peux chercher en {' ou en '.join(autres)}, ou avec tous les modes : tu veux ?"
+
 
 def _intro_trajet(message, contexte, candidats, mode, historique, premiere, memoire_txt, infos_conditions) -> str:
     """Une phrase d'introduction naturelle (LLM) avant la liste des étapes."""
@@ -1900,7 +1905,7 @@ def _reponse_trajet(message, contexte, candidats, mode, historique, s, memoire_t
     if budget and extraire_budget(message) == budget:
         intro += f" Tous ces trajets respectent ton budget de {budget} FCFA."
     position = (candidats[0]["etapes"][0].get("depart_pos") if candidats[0].get("etapes") else None)
-    situe = _situer_sur_trajet(position, s.get("dernieres_options")) if premiere is False else ""
+    situe = _situer_sur_trajet(position, contexte.get("trajet_precedent"))
     parts = [intro] + ([situe] if situe else []) + ["Option 1 :\n" + decrire_trajet(candidats[0])]
     autres = len(candidats) - 1
     if autres > 0:
@@ -1931,6 +1936,9 @@ def _situer_sur_trajet(position: dict, options: list) -> str:
         return ""
     d, nom, n, e = meilleur
     ligne = f"{NOM_MODE.get(e['mode'], '')} {e.get('numero_ligne') or ''}".strip()
+    if nom == e["arrivee"]:
+        return (f"Tu es tout près de « {nom} » ({_dist_txt(d)}), l'arrêt de descente de l'étape {n} de ton trajet "
+                f"({ligne}) : descends-y, puis suis la suite ci-dessous.")
     return (f"Tu es tout près de « {nom} » ({_dist_txt(d)}), sur l'étape {n} de ton trajet ({ligne}) : "
             f"tu peux la continuer et descendre à « {e['arrivee']} ».")
 
