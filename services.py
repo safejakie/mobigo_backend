@@ -1975,7 +1975,10 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str,
                 continue
             idx_montee = seq1.index(montee_sid)
 
-            for a_arr in arrets_arr_corr[:30]:
+            # Ne pas tronquer les arrêts d'arrivée : un arrêt desservi par une ligne
+            # utile peut se trouver au-delà des 30 premiers, même s'il est plus proche
+            # de la destination qu'un terminus retenu par le classement précédent.
+            for a_arr in arrets_arr_corr:
                 for info2 in _lignes_passant_par(a_arr["id"], modes):
                     ligne2 = info2["ligne"]
                     if ligne2["id"] == ligne1["id"]:
@@ -3315,9 +3318,17 @@ def lignes_depuis_position(lat: float, lon: float, dest: dict, rayon_m: int = 50
                 "propose": (ligne["type"], _norm_num(ligne.get("numero"))) in deja,
             }
             ancien = meilleurs.get(rid)
-            if not ancien or res["montee_m"] + res["descente_a_dest_m"] < ancien["montee_m"] + ancien["descente_a_dest_m"]:
+            # Pour une même ligne, retenir d'abord l'arrêt de montée le plus
+            # proche de la position actuelle. La proximité de la destination
+            # départage les arrêts de montée à distance comparable.
+            if not ancien or (res["montee_m"], res["descente_a_dest_m"], res["rang"]) < \
+                    (ancien["montee_m"], ancien["descente_a_dest_m"], ancien["rang"]):
                 meilleurs[rid] = res
-    out = sorted(meilleurs.values(), key=lambda r: (r["montee_m"] + r["descente_a_dest_m"], r["rang"]))
+    # Le guidage donne d'abord l'arrêt de montée le plus proche de l'utilisateur.
+    # À distance comparable, il favorise le trajet déjà proposé, puis la descente
+    # la plus proche de la destination.
+    out = sorted(meilleurs.values(), key=lambda r: (r["montee_m"], not r["propose"],
+                                                      r["descente_a_dest_m"], r["rang"]))
     return out[:maxi]
 
 
@@ -3412,8 +3423,12 @@ def _reponse_guidage(message: str, contexte: dict, historique: list, s: dict, me
               "invite-le à confirmer sur place auprès des apprentis ou chauffeurs. Si une info manque, dis-le et "
               "demande-lui ce qu'il voit autour de lui (enseigne, grand bâtiment, carrefour). Ne renvoie jamais vers "
               "Google Maps ou Waze. "
-              "Ne cite AUCUNE ligne qui ne figure pas dans les lignes vérifiées ; si aucune n'est vérifiée, dis-le "
-              "honnêtement au lieu d'inventer. "
+              "Ne cite que les lignes, arrêts, distances et directions explicitement présents dans les lignes "
+              "vérifiées ou le trajet de l'utilisateur. Les lieux trouvés sur Google Maps ne prouvent pas qu'un "
+              "bus ou un gbaka y passe : ne les présente jamais comme arrêts ou gares de transport. "
+              "Si une ligne vérifiée correspond au trajet déjà proposé et reste accessible, continue ce trajet ; "
+              "ne le remplace par une autre ligne vérifiée que si elle améliore réellement l'accès à la destination. "
+              "Si aucune ligne n'est vérifiée, dis-le honnêtement au lieu d'inventer. "
               "5 phrases maximum, puis invite-le à te dire quand il y est pour continuer.")
     try:
         r = client.chat.completions.create(model=MODEL, messages=_messages_llm(SYSTEME_AMI + memoire_txt, prompt, historique),
