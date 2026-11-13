@@ -31,6 +31,7 @@ from services import (
     trajets_par_mode,
     arrets_proximite_par_modes,
     maj_session,
+    guider_utilisateur,
     message_aucun_trajet,
     SESSIONS,
     RESEAU,
@@ -409,6 +410,28 @@ def assistant_chat(demande: Demande):
         return repondre(
             generer_reponse(message, contexte_llm, demande.historique, session_id=session_id),
             intention="CONVERSATION",
+        )
+
+    # GUIDAGE : la personne est en route et dit où elle est / où prendre un bus, gbaka...
+    if intention == "GUIDAGE":
+        texte_pos = analyse.get("position") or ""
+        if demande.depart_lat is not None and demande.depart_lon is not None \
+                and (not texte_pos or est_position_actuelle(texte_pos)):
+            pos = {"nom": "ma position actuelle", "latitude": demande.depart_lat, "longitude": demande.depart_lon}
+        else:
+            pos = rechercher_lieu(texte_pos) if texte_pos else None
+        if texte_pos and not pos:
+            return repondre("Je ne trouve pas cet endroit 🤔 Donne-moi un repère plus précis "
+                            "(carrefour, pharmacie, station, nom d'arrêt...).", intention="CONVERSATION")
+        guide = guider_utilisateur(message, pos, session_id, demande.historique,
+                                   analyse.get("mode_transport"))
+        return repondre(
+            guide["reponse"],
+            intention="TRAJET" if guide["trajets"] else "CONVERSATION",
+            depart=Lieu(**pos) if pos else None,
+            arrets=guide["arrets"],
+            trajets=guide["trajets"],
+            trajet=guide["trajets"][0] if guide["trajets"] else None,
         )
 
     #  TRAJET / LIGNES_TRAJET 

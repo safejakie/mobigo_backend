@@ -4,6 +4,7 @@ import csv
 import difflib
 import functools
 import json
+import math
 import os
 import re
 import threading
@@ -58,7 +59,6 @@ def _charger_trace(trace_wkt, max_points: int = 1000):
     return points, (min(lats), min(lons), max(lats), max(lons))
 
 def _liste_arrets(texte: str) -> list:
-    """« A → B → C » devient ['A', 'B', 'C']."""
     if not texte or not isinstance(texte, str):
         return []
     parties = re.split(r"→|->", texte)
@@ -77,16 +77,13 @@ def _liste_coords(texte: str) -> list:
     return sortie
 
 def est_gare(nom: str) -> bool:
-    """Vrai si le nom parle d'une gare (« gare d'Adjamé », « Adjamé gare »...)."""
     return "gare" in nettoyer_texte(nom or "")
 
-# 2. LIEUX : Google Maps (SerpAPI) d'abord, nos arrêts locaux en secours 
+# ── 2. LIEUX : Google Maps (SerpAPI) d'abord, nos arrêts locaux en secours ──
 def _dans_abidjan(lat, lon) -> bool:
     return ABIDJAN_LAT[0] <= lat <= ABIDJAN_LAT[1] and ABIDJAN_LON[0] <= lon <= ABIDJAN_LON[1]
 
 def _google_maps(requete: str) -> list:
-    """Interroge Google Maps (via SerpAPI). Retourne [{nom, adresse, latitude, longitude}]
-    en gardant seulement les résultats situés dans Abidjan."""
     try:
         res = serpapi.search({"api_key": SERPAPI_KEY, "engine": "google_maps", "type": "search",
                               "q": requete, "ll": CENTRE_ABIDJAN, "hl": "fr", "gl": "ci"}).as_dict()
@@ -106,8 +103,6 @@ def _google_maps(requete: str) -> list:
     return sortie
 
 def _lieu_dans_nos_arrets(lieu: str):
-    """Secours : cherche le lieu dans les NOMS de nos arrêts (ex : « Azito » -> « Shell Azito »).
-    Accepte les petites fautes de frappe (« Zitoa »). Retourne le centre des arrêts trouvés."""
     if not RESEAU["charge"]:
         charger_reseau_local()
     mots = [m for m in extraire_mots(lieu) if len(m) >= 3]
@@ -124,13 +119,16 @@ def _lieu_dans_nos_arrets(lieu: str):
             trouves.append(a)
     if not trouves:
         return None
-    lat = sum(a["latitude"] for a in trouves) / len(trouves)
-    lon = sum(a["longitude"] for a in trouves) / len(trouves)
+    # Plusieurs arrêts portent ce nom dans des quartiers différents : on prend le plus important
+    # (celui où passent le plus de lignes) puis on fait la moyenne des arrêts à moins de 700 m de lui.
+    centre = max(trouves, key=lambda a: len(RESEAU["lignes_par_arret"].get(a["id"], [])))
+    groupe = [a for a in trouves if _dist_rapide(a["latitude"], a["longitude"], centre["latitude"], centre["longitude"]) <= 700]
+    lat = sum(a["latitude"] for a in groupe) / len(groupe)
+    lon = sum(a["longitude"] for a in groupe) / len(groupe)
     return {"nom": lieu.strip().title(), "latitude": lat, "longitude": lon, "alternatives": []}
 
+
 def rechercher_lieu(lieu: Optional[str]):
-    """Transforme un nom de lieu en coordonnées. Google Maps d'abord, sinon nos arrêts."""
-    lieu = (lieu or "").strip()
     if not lieu:
         return None
     cle = ("geo", lieu.lower())
@@ -152,9 +150,6 @@ def rechercher_lieu(lieu: Optional[str]):
     return resultat
 
 def suggestions_lieu(lieu: str, limite: int = 8) -> list:
-    """Suggestions pendant que l'utilisateur tape. Ordre : 1) nos arrêts qui contiennent TOUS les mots,
-    2) les vrais lieux de Google Maps (ex : « Université Félix Houphouët-Boigny »), 3) arrêts avec au moins
-    un mot. (Avant, les arrêts « Cocody » remplissaient les 8 places et Google n'était jamais interrogé.)"""
     lieu = (lieu or "").strip()
     if len(lieu) < 2:
         return []
@@ -206,7 +201,7 @@ def determiner_depart(dep_texte: Optional[str], lat: Optional[float] = None, lon
             return lieu
     return ma_position if a_gps else None
 
-# 3. DONNÉES : chargement des fichiers CSV 
+# 3. DONNÉES : chargement des fichiers CSV
 CATALOGUE = []                 # une entrée par ligne (bus, bateau, gbaka/woro)
 RESEAU = {
     "arrets": {},              # id -> {id, nom, latitude, longitude}
@@ -291,7 +286,7 @@ def charger_catalogue():
         CATALOGUE.append(e)
     log.info("catalogue charge : %d lignes", len(CATALOGUE))
 
-# 4. Petits calculs sur la carte 
+# ── Petits calculs sur la carte ──────────────────────────────────────────────
 def _dist_rapide(lat1, lon1, lat2, lon2) -> float:
     """Distance approximative en mètres (rapide, assez juste à Abidjan)."""
     dy = (lat1 - lat2) * 111320.0
@@ -325,7 +320,7 @@ def _point_proche_du_trace(lat, lon, trace, bbox, seuil_m=300) -> bool:
         return False
     return any(distance_m(lat, lon, tl, tn) <= seuil_m for tl, tn in trace)
 
-# ── Séquences d'arrêts : dans quel ordre une ligne passe par ses arrêts ─────
+#  Séquences d'arrêts : dans quel ordre une ligne passe par ses arrêts 
 def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
     """Liste ordonnée des arrêts situés à moins de seuil_m du tracé (sans doublons proches)."""
     passages = defaultdict(list)                       # arrêt -> [(position sur le tracé, distance)]
@@ -346,7 +341,7 @@ def _arrets_le_long_du_trace(trace, grille, taille, seuil_m, filtre=None):
             groupe = [h] if h else []
     evenements.sort()
     gardes = []
-    for _, sid in evenements:                         
+    for _, sid in evenements:                          # on enlève les arrêts de même nom très proches
         a = RESEAU["arrets"][sid]
         nom = nettoyer_texte(a["nom"])
         if not any(nettoyer_texte(RESEAU["arrets"][b]["nom"]) == nom and _dist_rapide(
@@ -599,7 +594,7 @@ def charger_reseau_local():
         log.info("reseau pret : %d arrets, %d lignes, %d sequences, %d gares", len(RESEAU["arrets"]),
                  len(RESEAU["lignes"]), len(RESEAU["sequences"]), len(RESEAU["gares"]))
 
-# 4. ARRÊTS À PROXIMITÉ
+# 4. ARRÊTS À PROXIMITÉ 
 def _types_de_l_arret(sid: str) -> set:
     """Les modes (BUS, GBAKA, BATEAU...) des lignes qui passent à cet arrêt."""
     return {RESEAU["lignes"][r]["type"] for r in RESEAU["lignes_par_arret"].get(sid, [])
@@ -652,7 +647,7 @@ def lignes_par_arret(stop_id: str) -> Optional[dict]:
     lignes.sort(key=lambda l: (0 if l["type"] == "BUS" else 1, l["numero"] or "zzz"))
     return {"arret": arret, "lignes": lignes}
 
-# ── 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS ──
+# 5. PRIX, TEXTES ET CHOIX DES PROPOSITIONS
 PRIX_CATALOGUE = {}            # (mode, numéro de ligne) -> prix lu dans le CSV
 
 def _norm_num(n) -> str:
@@ -778,7 +773,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
     if budget:
         cands = [c for c in cands if c.get("cout_partiel_fcfa", 0) <= budget]
     deja_proposes = _EXCLURE.get()
-    if deja_proposes:                                  # « autre chose » : on retire ce qui a déjà été proposé
+    if deja_proposes:
         cands = [c for c in cands if not any(_quasi_identiques(c, p) for p in deja_proposes)]
     if not cands:
         return []
@@ -812,7 +807,7 @@ def choisir_propositions(candidats: list, mode_filtre: str = "TOUS",
             groupes.setdefault(cle_groupe(c), []).append(c)
         fusion = []
         for g in sorted(groupes.values(), key=lambda g: cle(g[0])):
-            for k in fusion:                           # quasi-doublon : on fusionne
+            for k in fusion:                           
                 if _quasi_identiques(k[0], g[0]):
                     k.extend(g)
                     break
@@ -1252,7 +1247,7 @@ def _construire_candidats_rayon(dep: dict, dest: dict, mode_filtre: str, prix_ma
             vus.add(sig)
             uniques.append(c)
     candidats = uniques[:10]
-    for c in candidats:                                # on enlève les marches de correspondance < 30 m
+    for c in candidats:                                
         n = len(c["etapes"])
         c["etapes"] = [e for i, e in enumerate(c["etapes"])
                        if not (e["mode"] == "MARCHE" and 0 < i < n - 1 and e.get("distance_m", 0) < 30)]
@@ -1310,7 +1305,7 @@ def arrets_proches_trajet(dep: dict, dest: dict, mode_filtre: str = "TOUS", rayo
             "arrivee": arrets_proximite_par_modes(dest["latitude"], dest["longitude"], rayon_m, modes)[:5]}
 
 
-# ── 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche) ──
+# 7. API POUR LE FRONTEND (écrans « lignes », « détail d'une ligne », recherche) 
 def prix_connu(mode, nom_ligne, montee, descente, numero):
     if numero and str(numero) in PRIX_LIGNES:
         return PRIX_LIGNES[str(numero)]
@@ -1439,7 +1434,7 @@ def _sens_ligne_bus(fiche, index_catalogue, origine, destination, numero) -> lis
     if not cands:
         return []
 
-    def repere(nom):                                   # l'arrêt qui porte le nom de l'origine / destination
+    def repere(nom):                                   
         meilleur, sc = None, 0.5
         for sq in cands:
             for sid in sq:
@@ -1541,7 +1536,7 @@ def instructions_trajet(candidat: dict) -> list:
             f"de {e['depart']} a {e['arrivee']}" for e in candidat["etapes"]]
 
 
-# 8. ASSISTANT MOBIGUIDE (comprendre le message + répondre avec le LLM Groq)
+# 8. ASSISTANT MOBIGUIDE (comprendre le message + répondre avec le LLM Groq) 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 # Mémoire de conversation : une case par session_id (départ, destination, budget, mode...)
 SESSIONS = defaultdict(lambda: {"depart": None, "destination": None, "dernier_trajet": None,
@@ -1564,13 +1559,13 @@ def maj_session(session_id: str, intention: dict, trajet: dict = None, attente_m
     if attente_mode is not None:
         s["attente_mode"] = attente_mode
         if attente_mode:
-            s["mode_demande"] = True                   # la question « quel mode ? » n'est posée qu'une fois
+            s["mode_demande"] = True                   
 
 def extraire_budget(texte: str) -> Optional[int]:
     """Comprend « j'ai 400 », « 400 balles », « moins de 300 », « 2 mille », « 1 500 francs »..."""
     t = (texte or "").lower().replace(" ", " ").replace(" ", " ")
     nombre = r"(\d{1,3}(?:[ .]\d{3})+|\d+)"
-    motifs = (nombre + r"\s*(?:mille|milles|k)\b",                                      # « 2 mille »
+    motifs = (nombre + r"\s*(?:mille|milles|k)\b",                                     
               nombre + r"\s*(?:fcfa|f\.?\s?cfa|cfa|francs?|frs?\b|f\b|balles?|piastres?|billets?)",
               r"(?:budget|maximum|max|co[uû]t|prix|dans les|moins de|pas plus de|jusqu['’]?\s?[àa]|"
               r"j['’]?ai(?: seulement| juste| que)?|je n['’]?ai que|il me reste|me reste|je dispose de|"
@@ -1637,7 +1632,7 @@ def _completer_analyse(data: dict, s: dict, mode_msg, budget_msg) -> dict:
         data["intention"] = "CONVERSATION"             # jamais de réponse figée : on discute normalement
     if data["intention"] == "SUIVI" and not s.get("dernieres_options"):
         data["intention"] = "CONVERSATION"
-    for cle in ("depart", "destination", "priorite", "prix_max_ligne"):
+    for cle in ("depart", "destination", "priorite", "prix_max_ligne", "position"):
         data.setdefault(cle, None)
     data.update(mode_transport="TOUS", mode_precise=False, budget_fcfa=None)
     if data["intention"] in ("TRAJET", "LIGNES_TRAJET"):
@@ -1657,6 +1652,31 @@ def _trajet_demande(s, mode, mode_precise, budget, **plus) -> dict:
             "mode_transport": mode, "mode_precise": mode_precise, "priorite": None,
             "budget_fcfa": budget, "prix_max_ligne": None, **plus}
 
+_LIEU_RE = (r"(?:je suis|j.?suis|me voila|nous sommes|on est)\s+(?:rendu[e]?\s+|arrive[e]?\s+|descendu[e]?\s+|"
+            r"bloque[e]?\s+|perdu[e]?\s+)?(?:(?:a|au|aux|devant|derriere|pres de|pres du|pres des|chez|dans|sur|vers|"
+            r"en face de|en face du)\s+|(?=arrive|descendu|rendu))(.+?)(?:\s+(?:mais|et|donc|je|ou|car|alors|il|on)\b|[,.;!?]|$)")
+_OU_RE = (r"(\bou (est|sont|se trouve|se trouvent|charge|chargent|prend|prends|prendre|descendre|monter|attendre|"
+          r"je (prends?|peux|dois|descends?|monte|vais))|je (ne )?(sais|vois|trouve) pas|je (ne )?vois (rien|pas)|"
+          r"perdu|comment (je|on) (fais|rejoins|rejoindre|continue)|c.?est ou|quel(le)? (arret|ligne|bus|gbaka))")
+_NOUVEAU_RE = r"(veux aller|voudrais aller|pour aller|aller (a|au|aux)\b|trajet (de|pour)|itineraire|je vais (a|au|aux)\b)"
+
+
+def _detecter_guidage(msg: str, s: dict, parle_mode: bool):
+    """MobiGuide ne fait pas que proposer des trajets : il accompagne. Si la personne dit où elle est
+    ou demande où prendre/trouver un bus/gbaka, c'est du GUIDAGE (pas un nouveau trajet).
+    Retourne None (pas du guidage) ou le lieu où elle se trouve ('' si non précisé)."""
+    if re.search(_NOUVEAU_RE, msg):
+        return None
+    lieu = re.search(_LIEU_RE, msg)
+    lieu = re.sub(r"^(la|le|les|l)\s+", "", lieu.group(1).strip()) if lieu else ""
+    lieu = "" if re.fullmatch(r"(pressee?|fatigue[e]?|content[e]?|pret[e]?|a pied|en retard|la|ici)?", lieu) else lieu
+    en_trajet = bool(s.get("dernieres_options") or s.get("dernier_trajet"))
+    question = bool(re.search(_OU_RE, msg))
+    if (lieu and (en_trajet or question)) or (question and (en_trajet or parle_mode)):
+        return lieu
+    return None
+
+
 def analyser_intention(message: str, historique: list = None, session_id: str = None) -> dict:
     """Comprend le message : TRAJET, SUIVI (question sur les trajets), CONVERSATION... + lieux/budget/mode."""
     s = SESSIONS[session_id] if session_id else {}
@@ -1666,6 +1686,11 @@ def analyser_intention(message: str, historique: list = None, session_id: str = 
     question = re.search(r"(c.?est quoi|qu.?est.?ce|\bpourquoi\b|comment fonctionne|\bcombien\b|est.?ce que|"
                          r"\bou est\b|\bquel(le)?s? (est|sont)\b)", msg)
     # 1) Règles rapides (sans LLM)
+    guide = _detecter_guidage(msg, s, bool(mode_msg))
+    if guide is not None:                              # « je suis à la Liberté, où chargent les gbakas ? »
+        data = _completer_analyse({"intention": "GUIDAGE", "position": guide or None}, s, mode_msg, budget_msg)
+        data["mode_transport"] = mode_msg or "TOUS"
+        return data
     if re.search(r"(comment (tu|vous) (t|vous )?.?appel|qui (es|etes).?(tu|vous)|tu es qui|ton nom|"
                  r"c.?est quoi ton nom|tu fais quoi|presente.?toi)", msg):
         return _completer_analyse({"intention": "CONVERSATION"}, s, mode_msg, budget_msg)
@@ -1711,12 +1736,14 @@ Historique récent :
 {historique_texte}
 {memoire}
 Format exact :
-{{"intention": "TRAJET" ou "SUIVI" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+{{"intention": "TRAJET" ou "SUIVI" ou "GUIDAGE" ou "CONVERSATION" ou "LIGNES_TRAJET" ou "INCONNUE",
+  "position": "lieu où l'utilisateur SE TROUVE MAINTENANT (guidage) ou null",
   "depart": "lieu de départ ou null", "destination": "lieu d'arrivée ou null",
   "priorite": "duree" ou "prix" ou null, "prix_max_ligne": nombre ou null}}
 Règles :
 - "ma position", "ici", "je suis là", "près de moi" -> depart = "ma position actuelle"
 - CONVERSATION pour TOUT ce qui n'est pas un déplacement (salutation, merci, culture générale, blague, question sur toi...)
+- GUIDAGE : l'utilisateur est en route et dit où il est ou demande où prendre/trouver un bus, gbaka, bateau, arrêt
 - TRAJET uniquement si l'utilisateur veut aller quelque part ou relance/modifie la recherche
 - N'invente jamais un lieu : null s'il n'est ni dans le message ni dans la mémoire. Rien en dehors du JSON.
 """
@@ -1733,7 +1760,7 @@ Règles :
         log.error("erreur analyse intention : %s", e)
     return _completer_analyse({"intention": "INCONNUE"}, s, mode_msg, budget_msg)
 
-# Textes de réponse 
+# Textes de réponse
 SYSTEME_AMI = (
     "Tu es MobiGuide, un assistant sympa basé à Abidjan. Tu discutes naturellement, comme un ami : "
     "tu réponds à toutes les questions (pas seulement les transports), en français, de façon courte "
@@ -1741,7 +1768,8 @@ SYSTEME_AMI = (
     "pas tout aux trajets. Tu ne répètes jamais une formule d'accueil (« avec plaisir », « bonne "
     "nouvelle »...) ni un conseil que tu as déjà donné plus haut dans la conversation : tu varies et "
     "tu réponds précisément à ce que l'utilisateur demande maintenant. "
-    "Tu t'appelles MobiGuide, l'assistant de l'application MobiGo. Tu es toujours accueillant, chaleureux et tu "
+    "Tu t'appelles MobiGuide, l'assistant de l'application MobiGo : tu proposes des trajets ET tu guides l'utilisateur "
+    "pas à pas jusqu'à sa destination. Tu es toujours accueillant, chaleureux et tu "
     "guides l'utilisateur ; tu ne refuses jamais de répondre à une question simple. "
     "Si tu ne connais pas la réponse, dis-le clairement et demande une précision ; "
     "n'invente jamais une information, une ligne, un prix ou une fonctionnalité.")
@@ -1809,41 +1837,6 @@ def _dist_txt(m) -> str:
     m = int(m or 0)
     return f"{m / 1000:.1f} km".replace(".", ",") if m >= 1000 else f"{m} m"
 
-def decrire_trajet(c: dict) -> str:
-    """Raconte le trajet étape par étape (marche, montée, rang de l'arrêt de descente, correspondance).
-    Tout vient des données calculées, rien n'est inventé."""
-    etapes = c.get("etapes", []) or []
-    transports = [i for i, e in enumerate(etapes) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
-    dernier_t = transports[-1] if transports else -1
-    lignes, derniere_arrivee = [], None
-    for i, e in enumerate(etapes):
-        mode, d = e.get("mode"), e.get("distance_m", 0) or 0
-        if mode == "MARCHE":
-            if d < 30:
-                continue
-            duree = f" (environ {e['duree_minutes']} min)" if e.get("duree_minutes") else ""
-            if any(x.get("mode") != "MARCHE" for x in etapes[i + 1:]):
-                t = f"Marche {_dist_txt(d)} jusqu'à l'arrêt « {e.get('arrivee')} »{duree}."
-                if d > SEUIL_MARCHE_LONGUE_M:
-                    t += " C'est assez loin : tu peux aussi prendre un taxi ou un gbaka/woro-woro pour t'y rendre."
-            else:
-                t = f"Il te restera {_dist_txt(d)} à pied jusqu'à ta destination{duree}."
-                if d > SEUIL_MARCHE_LONGUE_M:
-                    t += " C'est assez long : un taxi ou un woro-woro peut t'y déposer."
-            lignes.append(t)
-        elif mode == "WORO_WORO":
-            lignes.append(f"Pour rejoindre l'arrêt « {e.get('arrivee')} » ({_dist_txt(d)}), prends un woro-woro ou un taxi.")
-        else:
-            if derniere_arrivee and derniere_arrivee != e.get("depart") and etapes[i - 1].get("mode") != "MARCHE":
-                lignes.append(f"Rejoins l'arrêt « {e.get('depart')} » (tout près, à pied).")
-            nom = "le " + NOM_MODE.get(mode, str(mode).lower()) + (f" {e['numero_ligne']}" if e.get("numero_ligne") else "")
-            n = e.get("nb_arrets") or 0
-            descente = f"descends au {_ordinal(n)} arrêt, à « {e.get('arrivee')} »" if n > 0 else f"descends à « {e.get('arrivee')} »"
-            lignes.append(f"Monte dans {nom} à « {e.get('depart')} », puis {descente}"
-                          + (" pour prendre la correspondance." if i < dernier_t else "."))
-            derniere_arrivee = e.get("arrivee")
-    return "\n".join(f"{k}. {t}" for k, t in enumerate(lignes, 1))
-
 def message_aucun_trajet(mode: str, dep: dict = None, dest: dict = None) -> str:
     """Message CLAIR quand aucun trajet n'existe. Dans un mode précis (ex : bateau-bus) : on dit non, on cite
     l'arrêt de ce mode le plus proche et on propose UNIQUEMENT les AUTRES modes (pas de boucle)."""
@@ -1892,7 +1885,7 @@ def _intro_trajet(message, contexte, candidats, mode, historique, premiere, memo
         return modele
 
 def _reponse_trajet(message, contexte, candidats, mode, historique, s, memoire_txt, infos_conditions) -> str:
-    """Réponse quand on présente des trajets : intro + option 1 détaillée + conseils nouveaux."""
+    """Réponse quand on présente des trajets : intro + conseils nouveaux (les étapes sont dans les cartes)."""
     premiere, budget = not s.get("nb_reponses_trajet"), contexte.get("budget_fcfa")
     if not candidats:
         if _EXCLURE.get():
@@ -1913,10 +1906,7 @@ def _reponse_trajet(message, contexte, candidats, mode, historique, s, memoire_t
         intro += f" Tous ces trajets respectent ton budget de {budget} FCFA."
     position = (candidats[0]["etapes"][0].get("depart_pos") if candidats[0].get("etapes") else None)
     situe = _situer_sur_trajet(position, contexte.get("trajet_precedent"))
-    parts = [intro] + ([situe] if situe else []) + ["Option 1 :\n" + decrire_trajet(candidats[0])]
-    autres = len(candidats) - 1
-    if autres > 0:
-        parts.append(f"J'ai aussi {autres} autre{'s' if autres > 1 else ''} option{'s' if autres > 1 else ''} dans les cartes.")
+    parts = [intro] + ([situe] if situe else [])
     deja = set(s.get("conseils_donnes") or [])
     nouveaux = [(k, t) for k, t in _conseils_liste(candidats, budget) if k not in deja]
     if nouveaux:                                       # on ne répète jamais un conseil déjà donné
@@ -1948,6 +1938,130 @@ def _situer_sur_trajet(position: dict, options: list) -> str:
                 f"({ligne}) : descends-y, puis suis la suite ci-dessous.")
     return (f"Tu es tout près de « {nom} » ({_dist_txt(d)}), sur l'étape {n} de ton trajet ({ligne}) : "
             f"tu peux la continuer et descendre à « {e['arrivee']} ».")
+
+def _direction(p: dict, q: dict) -> str:
+    """Direction (nord, sud-est...) pour aller du point p au point q."""
+    angle = math.degrees(math.atan2((q["longitude"] - p["longitude"]) * 0.9956, q["latitude"] - p["latitude"])) % 360
+    return ("nord", "nord-est", "est", "sud-est", "sud", "sud-ouest", "ouest", "nord-ouest")[int((angle + 22.5) // 45) % 8]
+
+
+def _arret_de_la_ligne_le_plus_proche(etape: dict, position: dict):
+    """L'arrêt de CETTE ligne (celle de l'étape proposée) le plus proche de la personne : (arrêt, distance)."""
+    meilleur = None
+    for rid, l in RESEAU["lignes"].items():
+        if l["type"] != etape["mode"] or (str(l.get("numero") or "") != str(etape.get("numero_ligne") or "") if etape.get("numero_ligne")
+                                           else l.get("nom") != etape.get("nom_ligne")):
+            continue
+        for seq in RESEAU["sequences"].get(rid, []):
+            for sid in seq:
+                a = RESEAU["arrets"].get(sid)
+                if a and sid not in RESEAU["points_libres"]:
+                    d = distance_m(position["latitude"], position["longitude"], a["latitude"], a["longitude"])
+                    if not meilleur or d < meilleur[1]:
+                        meilleur = (a, d)
+    return meilleur
+
+
+def _decrire_arret(a: dict, position: dict, d=None) -> str:
+    """« Marché Cocody » à 120 m (au nord) — lignes : bus 27, gbaka Adjamé ↔ Abobo."""
+    d = d if d is not None else distance_m(position["latitude"], position["longitude"], a["latitude"], a["longitude"])
+    lignes = []
+    for rid in RESEAU["lignes_par_arret"].get(a["id"], []):
+        l = RESEAU["lignes"].get(rid)
+        if l and l["type"] in ("BUS", "GBAKA", "BATEAU"):
+            nom = re.sub(r"^(gbaka|woro-woro|woro)\s*:\s*", "", str(l.get("numero") or l.get("nom")), flags=re.I)
+            lignes.append(f"{NOM_MODE[l['type']]} {nom}")
+    lignes = list(dict.fromkeys(lignes))
+    plus = f", lignes : {', '.join(lignes[:4])}{'…' if len(lignes) > 4 else ''}" if lignes else ""
+    return f"« {a['nom']} » à {_dist_txt(d)} ({'sur place' if d < 40 else 'direction ' + _direction(position, a)}{plus})"
+
+
+def guider_utilisateur(message: str, position: Optional[dict], session_id: str = None,
+                       historique: list = None, mode: str = None) -> dict:
+    if not RESEAU["charge"]:
+        charger_reseau_local()
+    s = SESSIONS[session_id] if session_id else {}
+    if not position:
+        return {"reponse": "Dis-moi où tu es (un quartier, un arrêt, un repère connu) ou active ta position, "
+                           "et je te guide pas à pas 📍", "arrets": [], "trajets": []}
+    if session_id:
+        s["position"] = position.get("nom")
+    trajet = s.get("dernier_trajet") or ((s.get("dernieres_options") or [None])[0])
+    etapes = [e for e in (trajet or {}).get("etapes", []) if e.get("mode") not in ("MARCHE", "WORO_WORO")]
+    faits, suivant, trajets = [f"Position comprise : « {position.get('nom')} »."], None, []
+
+    # 1) Où en est la personne sur le trajet déjà proposé ? (on mesure en coordonnées GPS)
+    meilleur = None
+    for n, e in enumerate(etapes):
+        pts = [("fin", e.get("arrivee_pos")), ("debut", e.get("depart_pos"))] + [("route", a) for a in e.get("arrets", [])]
+        for genre, p in pts:
+            if p and p.get("latitude") is not None:
+                d = distance_m(position["latitude"], position["longitude"], p["latitude"], p["longitude"])
+                if d <= 400 and (not meilleur or d < meilleur[0]):
+                    meilleur = (d, n, genre)
+    if etapes and meilleur:
+        _, n, genre = meilleur
+        e = etapes[n]
+        ligne = f"{NOM_MODE.get(e['mode'])} {_nom_court_ligne(e)}"
+        if genre == "fin" and n + 1 < len(etapes):
+            suivant = etapes[n + 1]
+            faits.append(f"Tu as terminé l'étape {n + 1} ({ligne}). Prochaine étape : {NOM_MODE[suivant['mode']]} "
+                         f"{_nom_court_ligne(suivant)} jusqu'à « {suivant['arrivee']} ».")
+        elif genre == "fin":
+            fin = (trajet["etapes"][-1] if trajet["etapes"][-1]["mode"] == "MARCHE" else None)
+            faits.append(f"Tu es arrivé à l'arrêt de descente « {e['arrivee']} »." + (
+                f" Il te reste {_dist_txt(fin['distance_m'])} à pied jusqu'à ta destination, direction "
+                f"{_direction(position, fin['arrivee_pos'])}." if fin and fin.get("arrivee_pos") else ""))
+        else:
+            suivant = e if genre == "debut" else None
+            faits.append(f"Tu es sur l'étape {n + 1} de ton trajet ({ligne}) : " + (
+                f"monte ici, puis descends à « {e['arrivee']} »." if genre == "debut" else
+                f"reste dans le véhicule jusqu'à « {e['arrivee']} » (tu peux demander au chauffeur ou à l'apprenti)."))
+    elif etapes:                                       # hors du trajet : on recalcule depuis ici vers la destination
+        fin = trajet["etapes"][-1]
+        if fin.get("arrivee_pos"):
+            dest = {"nom": s.get("destination") or fin.get("arrivee") or "destination", **fin["arrivee_pos"]}
+            options = choisir_propositions(candidats_multimodaux(position, dest, "TOUS"))
+            if options:
+                trajets, suivant = options, _etapes_transport(options[0])[0]
+                if session_id:
+                    s["dernieres_options"], s["dernier_trajet"] = options, options[0]
+                faits.append("Tu n'es plus sur le trajet proposé : je recalcule depuis ta position. Le plus simple : "
+                             + _points_cles(options[0]) + ". Les options sont dans les cartes.")
+
+    # 2) Où prendre le prochain véhicule / le mode demandé ?
+    modes = {mode} if mode in ("BUS", "GBAKA", "BATEAU") else ({suivant["mode"]} if suivant else {"BUS", "GBAKA", "BATEAU"})
+    modes &= {"BUS", "GBAKA", "BATEAU"}
+    if suivant and suivant["mode"] in ("BUS", "GBAKA", "BATEAU"):
+        ligne_proche = _arret_de_la_ligne_le_plus_proche(suivant, position)
+        if ligne_proche and ligne_proche[1] <= 1500:
+            ligne = f"{NOM_MODE[suivant['mode']]} {_nom_court_ligne(suivant)}"
+            faits.append(f"Pour prendre le {ligne} : l'arrêt le plus proche de toi est {_decrire_arret(ligne_proche[0], position, ligne_proche[1])}.")
+    proches = arrets_proximite_par_modes(position["latitude"], position["longitude"], 1000, list(modes))[:4]
+    lib = " / ".join(NOM_MODE[m] for m in sorted(modes))
+    if proches:
+        faits.append(f"Arrêts de {lib} autour de toi (d'après mes données) : "
+                     + " ; ".join(_decrire_arret(RESEAU["arrets"][a["id"]], position, a["distance_m"]) for a in proches) + ".")
+    else:
+        faits.append(f"Je ne trouve aucun arrêt de {lib} à moins de 1 km dans mes données. Demande à un passant, "
+                     f"ou donne-moi un repère plus précis (carrefour, pharmacie, station...) et je regarde à nouveau.")
+
+    # 3) Réponse naturelle (LLM) à partir des faits, sinon texte direct
+    texte = "\n".join(faits)
+    if client:
+        prompt = (f"{message}\n\n[FAITS vérifiés (données GPS/CSV) : {texte}]\n"
+                  "Guide la personne pas à pas, en 3 à 5 phrases simples et chaleureuses, en français. Utilise UNIQUEMENT ces "
+                  "faits (noms d'arrêts, distances, directions) : n'invente aucun arrêt, ligne ni prix. Réponds précisément à "
+                  "ce qu'elle demande (ex : où chargent les gbakas). Ne redonne pas tout le trajet. Termine par une courte "
+                  "question ou consigne (ex : « dis-moi quand tu y es »).")
+        try:
+            r = client.chat.completions.create(model=MODEL, temperature=0.4, max_tokens=500,
+                                               messages=_messages_llm(SYSTEME_AMI, prompt, historique))
+            texte = _phrase_complete(r.choices[0].message.content, r.choices[0].finish_reason == "length") or texte
+        except Exception as e:
+            log.error("erreur guidage : %s", e)
+    return {"reponse": texte, "arrets": proches, "trajets": trajets}
+
 
 def generer_reponse(message: str, contexte: dict, historique: list = None, session_id: str = None) -> str:
     """Réponse finale de MobiGuide selon le statut : TRAJET, SUIVI (question sur un trajet) ou CONVERSATION."""
@@ -2001,4 +2115,4 @@ ne réponds pas à ce genre de questions. Termine, quand c'est naturel, par une 
         return "Je suis MobiGuide. Dis-moi où tu veux aller et je te propose un trajet."
 
 
-choisir_options = choisir_propositions    # ancien nom utilisé par main.py
+choisir_options = choisir_propositions   
